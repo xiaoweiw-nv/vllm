@@ -33,6 +33,7 @@ class BlockTable:
         kernel_block_size: int,
         cp_kv_cache_interleave_size: int,
         slot_mapping_mode: SlotMappingMode = SlotMappingMode.TOKEN_TO_KV_SLOT,
+        cp_world_size: int | None = None,
     ):
         """
         Args:
@@ -110,6 +111,17 @@ class BlockTable:
             self.dcp_rank = 0
         self.cp_kv_cache_interleave_size = cp_kv_cache_interleave_size
         self.slot_mapping_mode = slot_mapping_mode
+        configured_cp_size = self.pcp_world_size * self.dcp_world_size
+        configured_cp_rank = self.pcp_rank * self.dcp_world_size + self.dcp_rank
+        self.cp_world_size = (
+            configured_cp_size if cp_world_size is None else cp_world_size
+        )
+        if self.cp_world_size < 1 or configured_cp_size % self.cp_world_size != 0:
+            raise ValueError(
+                f"cp_world_size={self.cp_world_size} must divide configured CP "
+                f"size {configured_cp_size}"
+            )
+        self.cp_rank = configured_cp_rank % self.cp_world_size
 
     def append_row(
         self,
@@ -163,8 +175,8 @@ class BlockTable:
             return
         assert self.slot_mapping_mode == SlotMappingMode.TOKEN_TO_KV_SLOT
 
-        total_cp_world_size = self.pcp_world_size * self.dcp_world_size
-        total_cp_rank = self.pcp_rank * self.dcp_world_size + self.dcp_rank
+        total_cp_world_size = self.cp_world_size
+        total_cp_rank = self.cp_rank
         _compute_slot_mapping_kernel[(num_reqs + 1,)](
             num_tokens,
             self.max_num_batched_tokens,
@@ -254,6 +266,7 @@ class MultiGroupBlockTable:
         max_num_blocks: list[int],
         cp_kv_cache_interleave_size: int = 1,
         slot_mapping_modes: list[SlotMappingMode] | None = None,
+        group_cp_sizes: list[int] | None = None,
     ) -> None:
         if len(kernel_block_sizes) != len(block_sizes):
             raise ValueError(
@@ -265,6 +278,16 @@ class MultiGroupBlockTable:
         if len(slot_mapping_modes) != len(block_sizes):
             raise ValueError(
                 f"slot_mapping_modes length ({len(slot_mapping_modes)}) "
+                f"must match block_sizes length ({len(block_sizes)})"
+            )
+        effective_group_cp_sizes: list[int | None]
+        if group_cp_sizes is None:
+            effective_group_cp_sizes = [None] * len(block_sizes)
+        else:
+            effective_group_cp_sizes = list(group_cp_sizes)
+        if len(effective_group_cp_sizes) != len(block_sizes):
+            raise ValueError(
+                f"group_cp_sizes length ({len(effective_group_cp_sizes)}) "
                 f"must match block_sizes length ({len(block_sizes)})"
             )
 
@@ -292,14 +315,20 @@ class MultiGroupBlockTable:
                 kernel_block_size,
                 cp_kv_cache_interleave_size,
                 slot_mapping_mode=slot_mapping_mode,
+                cp_world_size=group_cp_size,
             )
             for (
                 block_size,
                 kernel_block_size,
                 max_num_blocks_per_req,
                 slot_mapping_mode,
+                group_cp_size,
             ) in zip(
-                block_sizes, kernel_block_sizes, max_num_blocks, slot_mapping_modes
+                block_sizes,
+                kernel_block_sizes,
+                max_num_blocks,
+                slot_mapping_modes,
+                effective_group_cp_sizes,
             )
         ]
 

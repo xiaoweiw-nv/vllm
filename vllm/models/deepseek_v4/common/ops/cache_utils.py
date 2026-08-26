@@ -626,6 +626,7 @@ def combine_topk_swa_indices(
     topk: int,
     M: int,
     N: int,
+    positions: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     num_tokens = topk_indices.shape[0]
     num_reqs = seq_lens.shape[0]
@@ -656,6 +657,8 @@ def combine_topk_swa_indices(
         gather_lens,
         M,
         N,
+        positions if positions is not None else seq_lens,
+        USE_EXPLICIT_POSITIONS=positions is not None,
         TOP_K=topk,
         COMPRESS_RATIO=compress_ratio,
         WINDOW_SIZE=window_size,
@@ -676,6 +679,8 @@ def _combine_topk_swa_indices_kernel(
     gather_lens_ptr,
     M,
     N,
+    positions_ptr,
+    USE_EXPLICIT_POSITIONS: tl.constexpr,
     TOP_K: tl.constexpr,
     COMPRESS_RATIO: tl.constexpr,
     WINDOW_SIZE: tl.constexpr,
@@ -705,7 +710,10 @@ def _combine_topk_swa_indices_kernel(
         # min((pos + 1) // compress_ratio, topk_tokens) valid entries.
         # Caller passes TOP_K=0 for SWA-only layers to zero this out.
         token_idx_in_query = token_idx - query_start
-        pos = start_pos + token_idx_in_query
+        if USE_EXPLICIT_POSITIONS:
+            pos = tl.load(positions_ptr + token_idx)
+        else:
+            pos = start_pos + token_idx_in_query
         topk_len = tl.minimum((pos + 1) // COMPRESS_RATIO, TOP_K)
         swa_len = tl.minimum(pos + 1, WINDOW_SIZE)
 

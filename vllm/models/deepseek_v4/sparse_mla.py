@@ -7,11 +7,11 @@ from typing import Any, ClassVar
 
 import torch
 
+import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
 from vllm.platforms.interface import DeviceCapability
 from vllm.triton_utils import tl, triton
-from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -20,16 +20,13 @@ from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
     MultipleOf,
 )
-from vllm.v1.attention.backends.mla.compressor_utils import get_compressed_slot_mapping
+from vllm.v1.attention.backends.mla.compressor_utils import (
+    get_c128a_topk_width,
+    get_compressed_slot_mapping,
+    get_compressed_slot_mapping_from_positions,
+)
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 from vllm.v1.kv_cache_interface import AttentionSpec
-
-# Pad C128A topk width to this alignment. 128 covers both h_q=64 (B_TOPK=64) and
-# h_q=128 (B_TOPK=128). FlashMLA decode asserts extra_topk % B_TOPK == 0;
-# unaligned widths (e.g. 17 = ceil(2136/128)) crash the sm100 head64 kernel.
-# Padded slots stay -1 and decode_lens caps them via topk_length, so the pad is a
-# no-op at kernel level. Mirrors _SPARSE_PREFILL_TOPK_ALIGNMENT in cache_utils.py.
-_C128A_TOPK_ALIGNMENT = 128
 
 
 class DeepseekV4FlashMLABackend(AttentionBackend):
@@ -191,12 +188,9 @@ class DeepseekV4FlashMLAMetadataBuilder(
 
         # Pre-allocate C128A topk buffers for CUDA graph address stability.
         if self.compress_ratio == 128:
-            c128a_max_compressed = cdiv(
-                self.model_config.max_model_len, self.compress_ratio
-            )
-            c128a_max_compressed = (
-                cdiv(c128a_max_compressed, _C128A_TOPK_ALIGNMENT)
-                * _C128A_TOPK_ALIGNMENT
+            c128a_max_compressed = get_c128a_topk_width(
+                self.model_config.max_model_len,
+                self.compress_ratio,
             )
             # Stored so _build_c128a_metadata passes it as the kernel's
             # max_compressed_tokens, matching the buffer stride. Otherwise the
@@ -249,18 +243,32 @@ class DeepseekV4FlashMLAMetadataBuilder(
 
         slot_mapping = cm.slot_mapping
         if self.compress_ratio > 1:
-            slot_mapping = get_compressed_slot_mapping(
-                cm.num_actual_tokens,
-                cm.query_start_loc,
-                cm.seq_lens,
-                cm.block_table_tensor.clamp_(min=0),
-                int(self.kv_cache_spec.storage_block_size),
-                self.compress_ratio,
-                out=self.compressed_slot_mapping_buffer,
-                dcp_world_size=dcp_world_size,
-                dcp_rank=dcp_rank,
-                cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
-            )
+            if envs.VLLM_DSV4_CP2PP4:
+                if cm.num_reqs != 1 or cm.positions is None:
+                    raise RuntimeError(
+                        "CP2PP4 compressed metadata requires one request and "
+                        "explicit positions"
+                    )
+                slot_mapping = get_compressed_slot_mapping_from_positions(
+                    cm.positions[: cm.num_actual_tokens],
+                    cm.block_table_tensor.clamp_(min=0),
+                    int(self.kv_cache_spec.storage_block_size),
+                    self.compress_ratio,
+                    out=self.compressed_slot_mapping_buffer,
+                )
+            else:
+                slot_mapping = get_compressed_slot_mapping(
+                    cm.num_actual_tokens,
+                    cm.query_start_loc,
+                    cm.seq_lens,
+                    cm.block_table_tensor.clamp_(min=0),
+                    int(self.kv_cache_spec.storage_block_size),
+                    self.compress_ratio,
+                    out=self.compressed_slot_mapping_buffer,
+                    dcp_world_size=dcp_world_size,
+                    dcp_rank=dcp_rank,
+                    cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
+                )
 
         c128a_fields: dict[str, torch.Tensor | None] = {}
         if self.compress_ratio == 128:

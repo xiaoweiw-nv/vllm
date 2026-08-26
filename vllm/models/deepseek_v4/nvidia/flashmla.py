@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, cast
 
 import torch
 
+import vllm.envs as envs
 from vllm.forward_context import get_forward_context
 from vllm.models.deepseek_v4.attention import DeepseekV4Attention
 from vllm.models.deepseek_v4.common.ops import (
@@ -335,6 +336,9 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                 top_k,
                 chunk_M,
                 chunk_N,
+                positions=(
+                    positions[query_start:query_end] if envs.VLLM_DSV4_CP2PP4 else None
+                ),
             )
             flash_mla_sparse_fwd(
                 q=q[query_start:query_end],

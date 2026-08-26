@@ -5,6 +5,7 @@ from typing import ClassVar, cast
 
 import torch
 
+import vllm.envs as envs
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.platforms import current_platform
@@ -16,6 +17,9 @@ from vllm.v1.attention.backend import (
     AttentionMetadataBuilder,
     CommonAttentionMetadata,
     MultipleOf,
+)
+from vllm.v1.attention.backends.mla.compressor_utils import (
+    get_dspark_swa_index_width,
 )
 from vllm.v1.attention.ops.flashmla import FlashMLASchedMeta, get_mla_metadata
 from vllm.v1.kv_cache_interface import (
@@ -93,6 +97,7 @@ class DeepseekV4SWACache(torch.nn.Module, AttentionLayerBase):
             alignment=576 if uses_fp8_ds_mla_layout else 512,
             model_version="deepseek_v4",
             kv_quant_mode=get_kv_quant_mode(self.cache_config.cache_dtype),
+            dcp_replicated=envs.VLLM_DSV4_CP2PP4,
         )
 
     def forward(self): ...
@@ -416,7 +421,10 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         # width. decode_swa_lens keeps the padding out of the attention result.
         self.is_dspark = spec_config is not None and spec_config.use_dspark()
         self.noncausal_index_width = (
-            cdiv(self.window_size + self.num_speculative_tokens, 512) * 512
+            get_dspark_swa_index_width(
+                self.window_size,
+                self.num_speculative_tokens,
+            )
             if self.is_dspark
             else 0
         )
@@ -444,6 +452,13 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
         block_table = common_attn_metadata.block_table_tensor
         slot_mapping = common_attn_metadata.slot_mapping
+        explicit_positions = common_attn_metadata.positions
+        if envs.VLLM_DSV4_CP2PP4 and (
+            num_reqs != 1 or explicit_positions is None
+        ):
+            raise RuntimeError(
+                "CP2PP4 SWA metadata requires one request and explicit positions"
+            )
 
         # Split into decode and prefill portions using configurable threshold
         (num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens) = (
@@ -548,7 +563,9 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
                     block_table,
                     block_table.stride(0),
                     self.block_size,
+                    explicit_positions if explicit_positions is not None else seq_lens,
                     token_offset=0,
+                    USE_EXPLICIT_POSITIONS=explicit_positions is not None,
                     TRITON_BLOCK_SIZE=1024,
                 )
 
@@ -590,7 +607,9 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
                     block_table,
                     block_table.stride(0),
                     self.block_size,
+                    explicit_positions if explicit_positions is not None else seq_lens,
                     token_offset=num_decode_tokens,
+                    USE_EXPLICIT_POSITIONS=explicit_positions is not None,
                     TRITON_BLOCK_SIZE=1024,
                 )
 
@@ -707,6 +726,8 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
                 self.window_size,
                 BLOCK_SIZE=triton.next_power_of_2(num_prefills),
             )
+            if envs.VLLM_DSV4_CP2PP4:
+                pfx_gather_lens.copy_(seq_lens[num_decodes:])
 
             result["prefill_seq_lens"] = seq_lens[num_decodes:]
             result["prefill_seq_lens_cpu"] = seq_lens_cpu[num_decodes:]
@@ -824,7 +845,9 @@ def _compute_swa_indices_and_lens_kernel(
     block_table_ptr,
     block_table_stride,
     block_size,
+    positions_ptr,
     token_offset,
+    USE_EXPLICIT_POSITIONS: tl.constexpr,
     TRITON_BLOCK_SIZE: tl.constexpr,
 ):
     pid = tl.program_id(0)
@@ -850,7 +873,10 @@ def _compute_swa_indices_and_lens_kernel(
     seq_len = tl.load(seq_lens_ptr + req_idx)
     prefix_len = seq_len - query_len
 
-    pos = prefix_len + token_idx - query_start
+    if USE_EXPLICIT_POSITIONS:
+        pos = tl.load(positions_ptr + token_idx)
+    else:
+        pos = prefix_len + token_idx - query_start
     start_pos = tl.maximum(pos - window_size + 1, 0)
     end_pos = pos + 1
 

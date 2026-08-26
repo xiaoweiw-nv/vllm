@@ -25,7 +25,10 @@ from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
     MultipleOf,
 )
-from vllm.v1.attention.backends.mla.compressor_utils import get_compressed_slot_mapping
+from vllm.v1.attention.backends.mla.compressor_utils import (
+    get_compressed_slot_mapping,
+    get_compressed_slot_mapping_from_positions,
+)
 from vllm.v1.attention.backends.utils import (
     get_dcp_local_seq_lens,
     split_decodes_and_prefills,
@@ -965,18 +968,32 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         compressed_slot_mapping = slot_mapping
         compressed_seq_lens = seq_lens
         if self.compress_ratio > 1 or use_dcp_local_kv:
-            compressed_slot_mapping = get_compressed_slot_mapping(
-                num_tokens,
-                query_start_loc,
-                seq_lens,
-                block_table,
-                self.kv_cache_spec.storage_block_size,
-                self.compress_ratio,
-                out=self.compressed_slot_mapping_buffer,
-                dcp_world_size=self.dcp_world_size if use_dcp_local_kv else 1,
-                dcp_rank=self.dcp_rank if use_dcp_local_kv else 0,
-                cp_kv_cache_interleave_size=self.cp_kv_cache_interleave_size,
-            )
+            if envs.VLLM_DSV4_CP2PP4:
+                if num_reqs != 1 or common_attn_metadata.positions is None:
+                    raise RuntimeError(
+                        "CP2PP4 indexer metadata requires one request and "
+                        "explicit positions"
+                    )
+                compressed_slot_mapping = get_compressed_slot_mapping_from_positions(
+                    common_attn_metadata.positions[:num_tokens],
+                    block_table,
+                    self.kv_cache_spec.storage_block_size,
+                    self.compress_ratio,
+                    out=self.compressed_slot_mapping_buffer,
+                )
+            else:
+                compressed_slot_mapping = get_compressed_slot_mapping(
+                    num_tokens,
+                    query_start_loc,
+                    seq_lens,
+                    block_table,
+                    self.kv_cache_spec.storage_block_size,
+                    self.compress_ratio,
+                    out=self.compressed_slot_mapping_buffer,
+                    dcp_world_size=self.dcp_world_size if use_dcp_local_kv else 1,
+                    dcp_rank=self.dcp_rank if use_dcp_local_kv else 0,
+                    cp_kv_cache_interleave_size=self.cp_kv_cache_interleave_size,
+                )
             compressed_seq_lens = seq_lens // self.compress_ratio
 
         prefill_metadata = None
@@ -1040,6 +1057,11 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                     compressed_seq_lens_cpu,
                     common_attn_metadata.block_table_tensor,
                     self.compress_ratio,
+                    positions=(
+                        common_attn_metadata.positions
+                        if envs.VLLM_DSV4_CP2PP4
+                        else None
+                    ),
                     query_slice=query_slice,
                     skip_kv_gather=query_slice.start > 0,
                     dcp_rank=self.dcp_rank,
@@ -1273,6 +1295,7 @@ def build_prefill_chunk_metadata(
     compressed_seq_lens_cpu: torch.Tensor,
     block_table: torch.Tensor,
     compress_ratio: int,
+    positions: torch.Tensor | None = None,
     query_slice: slice | None = None,
     skip_kv_gather: bool = False,
     dcp_rank: int = 0,
@@ -1341,11 +1364,13 @@ def build_prefill_chunk_metadata(
         cu_seq_len_ke,
         qs_start,
         qs_stop,
+        positions if positions is not None else uncompressed_seq_lens,
         dcp_rank,
         dcp_world_size,
         cp_kv_cache_interleave_size,
         BLOCK_SIZE=1024,
         COMPRESS_RATIO=compress_ratio,
+        USE_EXPLICIT_POSITIONS=positions is not None,
     )
 
     token_start = query_start_loc_cpu[start_idx].item()
@@ -1388,11 +1413,13 @@ def _build_prefill_chunk_metadata_kernel(
     cu_compressed_seq_len_ke_ptr,
     query_slice_start,
     query_slice_stop,
+    positions_ptr,
     DCP_RANK,
     DCP_WORLD,
     DCP_INTERLEAVE,
     BLOCK_SIZE: tl.constexpr,
     COMPRESS_RATIO: tl.constexpr,
+    USE_EXPLICIT_POSITIONS: tl.constexpr,
 ):
     batch_idx = tl.program_id(0)
 
@@ -1426,7 +1453,12 @@ def _build_prefill_chunk_metadata_kernel(
 
         # cu_seq_len_ke: row start + per-token context length. Under DCP the
         # global per-token length is sharded across ranks.
-        global_ctx = start_pos + 1 + offset
+        if USE_EXPLICIT_POSITIONS:
+            global_ctx = tl.load(
+                positions_ptr + abs_pos, mask=mask, other=0
+            ) + 1
+        else:
+            global_ctx = start_pos + 1 + offset
         len_per_token = global_ctx // COMPRESS_RATIO
         if DCP_WORLD > 1:
             # Per-rank local context length under interleave-aware DCP, matching

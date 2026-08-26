@@ -67,6 +67,7 @@ if TYPE_CHECKING:
     VLLM_DSPARK_FP8_DRAFT_HEAD: bool = False
     VLLM_USE_B12X_WO_PROJECTION: bool = False
     VLLM_USE_B12X_MOE: bool = False
+    VLLM_DSV4_CP2PP4: bool = False
     VLLM_NF3_GRID188_DECODE: bool = True
     VLLM_USE_B12X_MINIMAX_M3_MSA: bool = False
     VLLM_USE_B12X_DCP_A2A: bool = False
@@ -1121,6 +1122,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Use b12x for FP4 MoE experts.
     # This is opt-in while the b12x subsystems are brought over one at a time.
     "VLLM_USE_B12X_MOE": lambda: bool(int(os.getenv("VLLM_USE_B12X_MOE", "0"))),
+    # Experimental fixed-shape DeepSeek-V4 prototype: PCP2 x PP4, one
+    # request, and aligned 2048-token prefill chunks. This is intentionally
+    # opt-in while the cache exchange and scheduler restrictions are narrow.
+    "VLLM_DSV4_CP2PP4": lambda: bool(
+        int(os.getenv("VLLM_DSV4_CP2PP4", "0"))
+    ),
     "VLLM_NVFP4_MLA_DYNAMIC_SCALE": lambda: bool(
         int(os.getenv("VLLM_NVFP4_MLA_DYNAMIC_SCALE", "0"))
     ),

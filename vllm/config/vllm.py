@@ -983,6 +983,66 @@ class VllmConfig:
             "expandable_segments is automatically disabled)."
         )
 
+    def _verify_dsv4_cp2pp4(self) -> None:
+        if not envs.VLLM_DSV4_CP2PP4:
+            return
+        if self.model_config is None:
+            raise ValueError("VLLM_DSV4_CP2PP4 requires a model configuration")
+
+        parallel = self.parallel_config
+        scheduler = self.scheduler_config
+        checks = {
+            "tensor_parallel_size": (parallel.tensor_parallel_size, 1),
+            "pipeline_parallel_size": (parallel.pipeline_parallel_size, 4),
+            "prefill_context_parallel_size": (
+                parallel.prefill_context_parallel_size,
+                2,
+            ),
+            "decode_context_parallel_size": (
+                parallel.decode_context_parallel_size,
+                1,
+            ),
+            "data_parallel_size": (parallel.data_parallel_size, 1),
+            "max_num_seqs": (scheduler.max_num_seqs, 1),
+        }
+        mismatches = [
+            f"{name}={actual} (expected {expected})"
+            for name, (actual, expected) in checks.items()
+            if actual != expected
+        ]
+        if mismatches:
+            raise ValueError(
+                "VLLM_DSV4_CP2PP4 fixed-shape configuration mismatch: "
+                + ", ".join(mismatches)
+            )
+        if scheduler.max_num_batched_tokens not in (2048, 4096):
+            raise ValueError(
+                "VLLM_DSV4_CP2PP4 requires max_num_batched_tokens in "
+                f"(2048, 4096), got {scheduler.max_num_batched_tokens}"
+            )
+        architecture = self.model_config.architecture or ""
+        if "DeepseekV4" not in architecture:
+            raise ValueError(
+                "VLLM_DSV4_CP2PP4 only supports DeepSeek-V4, "
+                f"got architecture={architecture!r}"
+            )
+        if parallel.enable_expert_parallel:
+            raise ValueError("VLLM_DSV4_CP2PP4 requires expert parallelism disabled")
+        if self.cache_config.enable_prefix_caching:
+            raise ValueError("VLLM_DSV4_CP2PP4 requires prefix caching disabled")
+        if self.cache_config.cache_dtype != "fp8_ds_mla":
+            raise ValueError(
+                "VLLM_DSV4_CP2PP4 requires --kv-cache-dtype fp8_ds_mla"
+            )
+        if not scheduler.enable_chunked_prefill:
+            raise ValueError("VLLM_DSV4_CP2PP4 requires chunked prefill enabled")
+        if scheduler.async_scheduling:
+            raise ValueError("VLLM_DSV4_CP2PP4 requires async scheduling disabled")
+        if self.speculative_config is not None:
+            raise ValueError("VLLM_DSV4_CP2PP4 does not support speculative decoding")
+        if not self.model_config.enforce_eager:
+            raise ValueError("VLLM_DSV4_CP2PP4 currently requires eager execution")
+
     def __post_init__(self):
         """Verify configs are valid & consistent with each other."""
 
@@ -1692,6 +1752,7 @@ class VllmConfig:
                 custom_ops.append("+quant_fp8")
 
         self._verify_kv_transfer_compat()
+        self._verify_dsv4_cp2pp4()
         # Log the custom passes that are enabled
         self.compilation_config.pass_config.log_enabled_passes()
 

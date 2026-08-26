@@ -750,6 +750,7 @@ class DeepseekV4MoE(nn.Module):
             router_logits_dtype=torch.float32,
             enable_eplb=parallel_config.enable_eplb,
             num_redundant_experts=eplb_config.num_redundant_experts,
+            pcp_size=1 if envs.VLLM_DSV4_CP2PP4 else None,
         )
         self.n_local_experts = self.experts.expert_map_manager.local_num_experts
         self.experts_start_idx = 0

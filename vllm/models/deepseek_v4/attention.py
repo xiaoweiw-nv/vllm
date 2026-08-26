@@ -50,6 +50,11 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.models.deepseek_v4.common.rope import build_deepseek_v4_rope
 from vllm.models.deepseek_v4.compressor import DeepseekCompressor
+from vllm.models.deepseek_v4.cp2pp4 import (
+    exchange_cp2pp4_boundary_halo,
+    get_effective_cache_shard_count,
+    replicate_split_cache_rows_,
+)
 from vllm.utils.math_utils import cdiv
 from vllm.utils.multi_stream_utils import (
     CUDAGraphCaptureEventPool,
@@ -658,6 +663,27 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
     ) -> None:
         forward_context = get_forward_context()
         attn_metadata = forward_context.attn_metadata
+        expected_local_rows = self.max_num_batched_tokens // 2
+        is_cp2pp4_prefill = (
+            envs.VLLM_DSV4_CP2PP4
+            and isinstance(attn_metadata, dict)
+            and positions.shape[0] == expected_local_rows
+        )
+
+        if (
+            is_cp2pp4_prefill
+            and hidden_states.shape[0] == expected_local_rows
+            and (self.compressor is not None or self.indexer is not None)
+        ):
+            halo_hidden, halo_positions = exchange_cp2pp4_boundary_halo(
+                hidden_states, positions
+            )
+            if self.compressor is not None:
+                self.compressor.write_cp2pp4_halo(halo_hidden, halo_positions)
+            if self.indexer is not None:
+                self.indexer.compressor.write_cp2pp4_halo(
+                    halo_hidden, halo_positions
+                )
 
         # wq_b + kv_insert (+ MLA compressor when an indexer is present) ride
         # on the default stream so q stays on its consumer stream (forward_mqa
@@ -725,6 +751,23 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             # SWA-only layer: no compressor, no overlap.
             q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)
             q = self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
+
+        if is_cp2pp4_prefill:
+            assert isinstance(attn_metadata, dict)
+            swa_metadata = cast(
+                "DeepseekSparseSWAMetadata",
+                attn_metadata[self.swa_cache_layer.prefix],
+            )
+            replicate_split_cache_rows_(
+                self.swa_cache_layer.kv_cache,
+                swa_metadata.slot_mapping,
+                swa_metadata.block_size,
+                data_bytes=576,
+                scale_bytes=8,
+                expected_local_rows=expected_local_rows,
+            )
+            if self.compressor is not None:
+                self.compressor.replicate_cp2pp4_kv_cache()
 
         # MLA attention writes into the pre-allocated `out` buffer
         # ([num_tokens, padded_heads, head_dim]).
@@ -841,6 +884,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             alignment=576 if uses_fp8_ds_mla_layout else 512,
             model_version="deepseek_v4",
             kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
+            dcp_replicated=envs.VLLM_DSV4_CP2PP4,
         )
 
 
@@ -985,6 +1029,7 @@ class DeepseekV4IndexerCache(torch.nn.Module, AttentionLayerBase):
             compress_ratio=self.compress_ratio,
             # 576B for FlashMLA packing; 512B for FlashInfer sparse (#44577).
             alignment=576 if uses_fp8_ds_mla_layout else 512,
+            dcp_replicated=envs.VLLM_DSV4_CP2PP4,
         )
 
     def forward(self): ...
@@ -1046,19 +1091,23 @@ class DeepseekV4Indexer(nn.Module):
         self.quant_block_size = 128  # TODO: get from config
         self.topk_indices_buffer = topk_indices_buffer
 
-        cp_size = (
+        configured_cp_size = (
             vllm_config.parallel_config.prefill_context_parallel_size
             * vllm_config.parallel_config.decode_context_parallel_size
         )
+        cache_shard_count = get_effective_cache_shard_count(
+            configured_cp_size,
+            replicated=envs.VLLM_DSV4_CP2PP4,
+        )
         self.max_model_len = cdiv(
             vllm_config.model_config.max_model_len,
-            self.compress_ratio * cp_size,
+            self.compress_ratio * cache_shard_count,
         )
         self.prefix = prefix
 
         self.max_total_seq_len = cdiv(
             get_max_prefill_buffer_size(vllm_config),
-            self.compress_ratio * cp_size,
+            self.compress_ratio * cache_shard_count,
         )
 
         assert cache_config is not None, "Deepseek V4 indexer requires cache_config"
@@ -1098,6 +1147,7 @@ class DeepseekV4Indexer(nn.Module):
             use_fp4_cache=self.use_fp4_kv,
             num_q_heads=self.n_head,
             topk_scores_buffer=topk_scores_buffer,
+            dcp_replicated=envs.VLLM_DSV4_CP2PP4,
         )
 
         # None on ROCm — maybe_execute_in_parallel falls back to sequential.
@@ -1140,4 +1190,12 @@ class DeepseekV4Indexer(nn.Module):
                 events[1],
                 self.aux_stream,
             )
+        expected_local_rows = (
+            self.vllm_config.scheduler_config.max_num_batched_tokens // 2
+        )
+        if (
+            envs.VLLM_DSV4_CP2PP4
+            and positions.shape[0] == expected_local_rows
+        ):
+            compressor.replicate_cp2pp4_kv_cache()
         return self.indexer_op(hidden_states, q_quant, k, weights)

@@ -17,6 +17,7 @@ from vllm.models.deepseek_v4.common.ops.fused_compress_quant_cache import (
     compress_norm_rope_store_two_stage_triton,
 )
 from vllm.models.deepseek_v4.common.ops.fused_indexer_q import MXFP4_BLOCK_SIZE
+from vllm.models.deepseek_v4.cp2pp4 import replicate_split_cache_rows_
 from vllm.models.deepseek_v4.common.ops.save_partial_states import (
     save_partial_states,
 )
@@ -462,4 +463,75 @@ class DeepseekCompressor(nn.Module):
             token_stride=self._token_stride,
             scale_dim=self._scale_dim,
             **extra_kwargs,
+        )
+
+    def write_cp2pp4_halo(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> None:
+        """Project and install the four remote rows needed by a C4 window."""
+        if self.compress_ratio != 4:
+            return
+        kv_score = torch.mm(
+            hidden_states,
+            self.fused_wkv_wgate.weight.T,
+            out_dtype=torch.float32,
+        )
+        kv, score = kv_score.split(
+            [self.coff * self.head_dim, self.coff * self.head_dim], dim=-1
+        )
+        attn_metadata = get_forward_context().attn_metadata
+        if not isinstance(attn_metadata, dict):
+            return
+        state_metadata = cast(
+            CompressorMetadata, attn_metadata[self.state_cache.prefix]
+        )
+        block_size = state_metadata.block_size
+        block_indices = torch.div(positions, block_size, rounding_mode="floor")
+        block_numbers = state_metadata.block_table[0, block_indices]
+        slot_mapping = block_numbers.to(torch.int64) * block_size
+        slot_mapping += positions.remainder(block_size)
+        state_cache = self.state_cache.kv_cache
+        save_partial_states(
+            kv=kv,
+            score=score,
+            ape=self.ape,
+            positions=positions,
+            state_cache=state_cache,
+            slot_mapping=slot_mapping,
+            block_size=block_size,
+            state_width=state_cache.shape[-1] // 2,
+            compress_ratio=self.compress_ratio,
+            pdl_kwargs={"launch_pdl": False},
+        )
+
+    def replicate_cp2pp4_kv_cache(self) -> None:
+        """Replicate this chunk's newly compressed packed rows across PCP2."""
+        attn_metadata = get_forward_context().attn_metadata
+        if not isinstance(attn_metadata, dict):
+            return
+        k_cache_metadata = cast(Any, attn_metadata[self.k_cache_prefix])
+        k_cache_layer = self._static_forward_context[self.k_cache_prefix]
+
+        if self.head_dim == 512:
+            data_bytes = 576
+            scale_bytes = 8
+        elif self.head_dim == 128:
+            data_bytes = 128
+            scale_bytes = 4
+        else:
+            raise RuntimeError(
+                f"unsupported CP2PP4 compressor head_dim={self.head_dim}"
+            )
+
+        replicate_split_cache_rows_(
+            k_cache_layer.kv_cache,
+            k_cache_metadata.slot_mapping,
+            k_cache_layer.kv_cache.shape[1],
+            data_bytes,
+            scale_bytes,
+            expected_local_rows=(
+                self.max_num_batched_tokens // 2 // self.compress_ratio
+            ),
         )
