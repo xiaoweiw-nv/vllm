@@ -72,6 +72,8 @@ def make_b12x_custom_allreduce(
     custom_allreduce.disabled = False
     custom_allreduce._pcie_runtime = runtime
     custom_allreduce._pcie_dma = None
+    custom_allreduce._pcie_dma_stream = None
+    custom_allreduce._pcie_dma_stream_device = None
     custom_allreduce._pcie_capture_stream = None
     custom_allreduce._pcie_capture_channel_id = None
     custom_allreduce._pcie_allreduce_max_size = allreduce_max_size
@@ -191,6 +193,58 @@ def test_b12x_dma_min_bytes_is_configurable(
     monkeypatch.setenv("VLLM_PCIE_DMA_MIN_BYTES", "-1")
     with pytest.raises(ValueError, match="must be non-negative"):
         _b12x_pcie_dma_min_bytes()
+
+
+def test_b12x_dma_dedicated_stream_env_defaults_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("VLLM_PCIE_DMA_DEDICATED_STREAM", raising=False)
+
+    assert not envs.environment_variables["VLLM_PCIE_DMA_DEDICATED_STREAM"]()
+
+    monkeypatch.setenv("VLLM_PCIE_DMA_DEDICATED_STREAM", "1")
+    assert envs.environment_variables["VLLM_PCIE_DMA_DEDICATED_STREAM"]()
+
+
+def test_b12x_dma_dedicated_stream_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
+    custom_allreduce, _ = make_b12x_custom_allreduce(
+        allreduce_max_size=16,
+        fused_max_size=16,
+    )
+    dma = MagicMock()
+    dma.all_reduce.return_value = torch.empty(1)
+    custom_allreduce._pcie_dma = dma
+
+    current_stream = MagicMock()
+    comm_stream = MagicMock()
+    producer_done = MagicMock()
+    comm_done = MagicMock()
+    event_cls = MagicMock(side_effect=[producer_done, comm_done])
+    stream_context = MagicMock()
+    stream_context.__enter__.return_value = None
+    stream_context.__exit__.return_value = None
+
+    monkeypatch.setattr(envs, "VLLM_PCIE_DMA_DEDICATED_STREAM", True)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(
+        torch.cuda, "current_stream", lambda device=None: current_stream
+    )
+    monkeypatch.setattr(torch.cuda, "Stream", MagicMock(return_value=comm_stream))
+    monkeypatch.setattr(torch.cuda, "Event", event_cls)
+    monkeypatch.setattr(torch.cuda, "stream", MagicMock(return_value=stream_context))
+
+    inp = torch.empty(1)
+    out = torch.empty_like(inp)
+    result = custom_allreduce._pcie_dma_all_reduce(inp, out=out, stream=None)
+
+    assert result is dma.all_reduce.return_value
+    torch.cuda.Stream.assert_called_once_with(device=inp.device)
+    current_stream.record_event.assert_called_once_with(producer_done)
+    comm_stream.wait_event.assert_called_once_with(producer_done)
+    torch.cuda.stream.assert_called_once_with(comm_stream)
+    dma.all_reduce.assert_called_once_with(inp, out=out)
+    comm_stream.record_event.assert_called_once_with(comm_done)
+    current_stream.wait_event.assert_called_once_with(comm_done)
 
 
 def test_b12x_fused_custom_op_dispatch(monkeypatch) -> None:

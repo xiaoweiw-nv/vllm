@@ -7,7 +7,6 @@ from typing import Any, ClassVar
 
 import torch
 
-import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
 from vllm.platforms.interface import DeviceCapability
@@ -27,6 +26,7 @@ from vllm.v1.attention.backends.mla.compressor_utils import (
 )
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 from vllm.v1.kv_cache_interface import AttentionSpec
+from vllm.v1.worker.cp2pp4 import dsv4_cp2pp_fixed_shape_enabled
 
 
 class DeepseekV4FlashMLABackend(AttentionBackend):
@@ -243,7 +243,7 @@ class DeepseekV4FlashMLAMetadataBuilder(
 
         slot_mapping = cm.slot_mapping
         if self.compress_ratio > 1:
-            if envs.VLLM_DSV4_CP2PP4:
+            if dsv4_cp2pp_fixed_shape_enabled():
                 if cm.num_reqs != 1 or cm.positions is None:
                     raise RuntimeError(
                         "CP2PP4 compressed metadata requires one request and "

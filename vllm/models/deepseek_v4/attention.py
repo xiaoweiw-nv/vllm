@@ -27,6 +27,7 @@ from vllm.models.deepseek_v4.common.ops import (
     fused_indexer_q_rope_quant,
     fused_q_kv_rmsnorm,
 )
+from vllm.v1.worker.cp2pp4 import dsv4_cp2pp_fixed_shape_enabled
 
 if TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.sparse_swa import (
@@ -665,7 +666,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         attn_metadata = forward_context.attn_metadata
         expected_local_rows = self.max_num_batched_tokens // 2
         is_cp2pp4_prefill = (
-            envs.VLLM_DSV4_CP2PP4
+            dsv4_cp2pp_fixed_shape_enabled()
             and isinstance(attn_metadata, dict)
             and positions.shape[0] == expected_local_rows
         )
@@ -681,9 +682,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             if self.compressor is not None:
                 self.compressor.write_cp2pp4_halo(halo_hidden, halo_positions)
             if self.indexer is not None:
-                self.indexer.compressor.write_cp2pp4_halo(
-                    halo_hidden, halo_positions
-                )
+                self.indexer.compressor.write_cp2pp4_halo(halo_hidden, halo_positions)
 
         # wq_b + kv_insert (+ MLA compressor when an indexer is present) ride
         # on the default stream so q stays on its consumer stream (forward_mqa
@@ -884,7 +883,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             alignment=576 if uses_fp8_ds_mla_layout else 512,
             model_version="deepseek_v4",
             kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
-            dcp_replicated=envs.VLLM_DSV4_CP2PP4,
+            dcp_replicated=dsv4_cp2pp_fixed_shape_enabled(),
         )
 
 
@@ -1029,7 +1028,7 @@ class DeepseekV4IndexerCache(torch.nn.Module, AttentionLayerBase):
             compress_ratio=self.compress_ratio,
             # 576B for FlashMLA packing; 512B for FlashInfer sparse (#44577).
             alignment=576 if uses_fp8_ds_mla_layout else 512,
-            dcp_replicated=envs.VLLM_DSV4_CP2PP4,
+            dcp_replicated=dsv4_cp2pp_fixed_shape_enabled(),
         )
 
     def forward(self): ...
@@ -1097,7 +1096,7 @@ class DeepseekV4Indexer(nn.Module):
         )
         cache_shard_count = get_effective_cache_shard_count(
             configured_cp_size,
-            replicated=envs.VLLM_DSV4_CP2PP4,
+            replicated=dsv4_cp2pp_fixed_shape_enabled(),
         )
         self.max_model_len = cdiv(
             vllm_config.model_config.max_model_len,
@@ -1147,7 +1146,7 @@ class DeepseekV4Indexer(nn.Module):
             use_fp4_cache=self.use_fp4_kv,
             num_q_heads=self.n_head,
             topk_scores_buffer=topk_scores_buffer,
-            dcp_replicated=envs.VLLM_DSV4_CP2PP4,
+            dcp_replicated=dsv4_cp2pp_fixed_shape_enabled(),
         )
 
         # None on ROCm — maybe_execute_in_parallel falls back to sequential.
@@ -1194,7 +1193,7 @@ class DeepseekV4Indexer(nn.Module):
             self.vllm_config.scheduler_config.max_num_batched_tokens // 2
         )
         if (
-            envs.VLLM_DSV4_CP2PP4
+            dsv4_cp2pp_fixed_shape_enabled()
             and positions.shape[0] == expected_local_rows
         ):
             compressor.replicate_cp2pp4_kv_cache()

@@ -38,6 +38,7 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
     get_kv_cache_cp_shard_count,
 )
+from vllm.v1.worker.cp2pp4 import dsv4_cp2pp_fixed_shape_enabled
 
 logger = init_logger(__name__)
 
@@ -968,7 +969,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         compressed_slot_mapping = slot_mapping
         compressed_seq_lens = seq_lens
         if self.compress_ratio > 1 or use_dcp_local_kv:
-            if envs.VLLM_DSV4_CP2PP4:
+            if dsv4_cp2pp_fixed_shape_enabled():
                 if num_reqs != 1 or common_attn_metadata.positions is None:
                     raise RuntimeError(
                         "CP2PP4 indexer metadata requires one request and "
@@ -1059,7 +1060,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                     self.compress_ratio,
                     positions=(
                         common_attn_metadata.positions
-                        if envs.VLLM_DSV4_CP2PP4
+                        if dsv4_cp2pp_fixed_shape_enabled()
                         else None
                     ),
                     query_slice=query_slice,
@@ -1454,9 +1455,7 @@ def _build_prefill_chunk_metadata_kernel(
         # cu_seq_len_ke: row start + per-token context length. Under DCP the
         # global per-token length is sharded across ranks.
         if USE_EXPLICIT_POSITIONS:
-            global_ctx = tl.load(
-                positions_ptr + abs_pos, mask=mask, other=0
-            ) + 1
+            global_ctx = tl.load(positions_ptr + abs_pos, mask=mask, other=0) + 1
         else:
             global_ctx = start_pos + 1 + offset
         len_per_token = global_ctx // COMPRESS_RATIO

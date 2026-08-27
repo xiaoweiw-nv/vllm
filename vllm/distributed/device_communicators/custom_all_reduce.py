@@ -262,6 +262,8 @@ class CustomAllreduce:
         self.disabled = True
         self._pcie_runtime = None
         self._pcie_dma = None
+        self._pcie_dma_stream: torch.cuda.Stream | None = None
+        self._pcie_dma_stream_device: torch.device | None = None
         self._pcie_capture_stream: torch.cuda.Stream | None = None
         self._pcie_capture_channel_id: str | None = None
         self._pcie_allreduce_max_size: int | None = None
@@ -744,6 +746,46 @@ class CustomAllreduce:
     def _pcie_runtime_channel_id(self) -> str:
         return self._pcie_capture_channel_id or _B12X_PCIE_EAGER_CHANNEL_ID
 
+    def _pcie_dma_dedicated_stream(self, device: torch.device) -> torch.cuda.Stream:
+        stream_device = self._pcie_dma_stream_device
+        if self._pcie_dma_stream is None or stream_device != device:
+            self._pcie_dma_stream = torch.cuda.Stream(device=device)
+            self._pcie_dma_stream_device = device
+        return self._pcie_dma_stream
+
+    def _pcie_dma_dedicated_stream_eligible(self) -> bool:
+        return (
+            envs.VLLM_PCIE_DMA_DEDICATED_STREAM
+            and not self._IS_CAPTURING
+            and not torch.cuda.is_current_stream_capturing()
+        )
+
+    def _pcie_dma_all_reduce(
+        self,
+        inp: torch.Tensor,
+        *,
+        out: torch.Tensor | None,
+        stream: torch.cuda.Stream | None,
+    ) -> torch.Tensor:
+        assert self._pcie_dma is not None
+        if stream is not None:
+            with torch.cuda.stream(stream):
+                return self._pcie_dma.all_reduce(inp, out=out)
+        if not self._pcie_dma_dedicated_stream_eligible():
+            return self._pcie_dma.all_reduce(inp, out=out)
+
+        current_stream = torch.cuda.current_stream(inp.device)
+        comm_stream = self._pcie_dma_dedicated_stream(inp.device)
+        producer_done = torch.cuda.Event()
+        comm_done = torch.cuda.Event()
+        current_stream.record_event(producer_done)
+        comm_stream.wait_event(producer_done)
+        with torch.cuda.stream(comm_stream):
+            result = self._pcie_dma.all_reduce(inp, out=out)
+        comm_stream.record_event(comm_done)
+        current_stream.wait_event(comm_done)
+        return result
+
     def register_graph_buffers(self):
         if self._pcie_runtime is not None:
             self._pcie_runtime.for_stream(
@@ -843,10 +885,7 @@ class CustomAllreduce:
                 and self._pcie_dma.should_allreduce(inp)
             ):
                 stream = self._pcie_runtime_stream()
-                if stream is not None:
-                    with torch.cuda.stream(stream):
-                        return self._pcie_dma.all_reduce(inp, out=out)
-                return self._pcie_dma.all_reduce(inp, out=out)
+                return self._pcie_dma_all_reduce(inp, out=out, stream=stream)
             if not self._pcie_logged_first_allreduce:
                 self._pcie_logged_first_allreduce = True
                 logger.debug(

@@ -46,8 +46,8 @@ from vllm.distributed.parallel_state import (
     GraphCaptureContext,
     checkpoint_b12x_graph_channels,
     get_dcp_group,
-    get_pp_group,
     get_pcp_group,
+    get_pp_group,
     get_tp_group,
     graph_capture,
     is_global_first_rank,
@@ -219,10 +219,10 @@ from vllm.v1.utils import CpuGpuBuffer, record_function_or_nullcontext
 from vllm.v1.worker import mamba_utils
 from vllm.v1.worker.block_table import SlotMappingMode
 from vllm.v1.worker.cp2pp4 import (
+    dsv4_cp2pp_fixed_shape_enabled,
     get_cp2pp4_local_tokens,
     localize_cp2pp4_chunk,
 )
-
 from vllm.v1.worker.cp_utils import (
     check_attention_cp_compatibility,
     get_dcp_dummy_context_len,
@@ -722,8 +722,7 @@ class GPUModelRunner(
         self._init_max_num_blocks = [placeholder_max_num_blocks]
         self._init_slot_mapping_modes = [SlotMappingMode.TOKEN_TO_KV_SLOT]
         self._init_group_cp_sizes = [
-            self.dcp_world_size
-            * self.parallel_config.prefill_context_parallel_size
+            self.dcp_world_size * self.parallel_config.prefill_context_parallel_size
         ]
         self.input_batch = InputBatch(
             max_num_reqs=self.max_num_reqs,
@@ -1980,11 +1979,9 @@ class GPUModelRunner(
 
         global_num_scheduled_tokens = num_scheduled_tokens
         cp2pp4_shard = None
-        if envs.VLLM_DSV4_CP2PP4:
+        if dsv4_cp2pp_fixed_shape_enabled():
             if num_reqs != 1:
-                raise ValueError(
-                    f"CP2PP4 supports one request, got {num_reqs}"
-                )
+                raise ValueError(f"CP2PP4 supports one request, got {num_reqs}")
             if self.num_prompt_logprobs:
                 raise ValueError(
                     "CP2PP4 does not support prompt logprobs in the "
@@ -2019,9 +2016,7 @@ class GPUModelRunner(
             num_scheduled_tokens, self.query_pos.np
         )
         if cp2pp4_shard is not None:
-            self.query_pos.np[:total_num_scheduled_tokens] = (
-                cp2pp4_shard.local_indices
-            )
+            self.query_pos.np[:total_num_scheduled_tokens] = cp2pp4_shard.local_indices
 
         # Get positions.
         positions_np = (
@@ -2228,12 +2223,11 @@ class GPUModelRunner(
             self.num_computed_tokens[:num_reqs] + num_scheduled_tokens_gpu
         )
         self.seq_lens[num_reqs:].fill_(0)
-        if envs.VLLM_DSV4_CP2PP4:
+        if dsv4_cp2pp_fixed_shape_enabled():
             self.seq_lens[:num_reqs].copy_(
                 self.optimistic_seq_lens_cpu[:num_reqs],
                 non_blocking=True,
             )
-
 
         self.input_batch.block_table.compute_slot_mapping(
             num_reqs,
@@ -4800,10 +4794,8 @@ class GPUModelRunner(
                 logits,
                 hidden_states,
                 (
-                    get_cp2pp4_local_tokens(
-                        scheduler_output.total_num_scheduled_tokens
-                    )
-                    if envs.VLLM_DSV4_CP2PP4
+                    get_cp2pp4_local_tokens(scheduler_output.total_num_scheduled_tokens)
+                    if dsv4_cp2pp_fixed_shape_enabled()
                     else scheduler_output.total_num_scheduled_tokens
                 ),
             )
@@ -7466,7 +7458,6 @@ class GPUModelRunner(
             f"InputBatch group_cp_sizes {self._init_group_cp_sizes} "
             f"!= KV-cache group CP sizes {group_cp_sizes}"
         )
-
 
     def _allocate_kv_cache_tensors(
         self, kv_cache_config: KVCacheConfig

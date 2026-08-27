@@ -77,6 +77,11 @@ from vllm.v1.outputs import (
     ModelRunnerOutput,
 )
 from vllm.v1.utils import compute_iteration_details, report_usage_stats
+from vllm.v1.worker.cp2pp4 import (
+    CP2PP4_SUPPORTED_CHUNK_SIZES,
+    dsv4_cp2pp_fixed_shape_enabled,
+    get_cp2pp4_local_tokens,
+)
 from vllm.v1.worker.startup_plan import (
     maybe_apply_startup_plan,
     maybe_save_startup_plan,
@@ -90,6 +95,89 @@ from .gpu.warmup import warmup_kernels
 from .utils import request_memory
 
 logger = init_logger(__name__)
+
+
+def _cp2pp4_pp_recv_tokens(num_scheduled_tokens: int) -> int:
+    return get_cp2pp4_local_tokens(num_scheduled_tokens)
+
+
+def _get_cp2pp4_scheduler_chunk_start(scheduler_output: SchedulerOutput) -> int:
+    if len(scheduler_output.num_scheduled_tokens) != 1:
+        raise ValueError(
+            "CP2PP4 supports one request, got "
+            f"{len(scheduler_output.num_scheduled_tokens)}"
+        )
+    req_id = next(iter(scheduler_output.num_scheduled_tokens))
+
+    for new_req in scheduler_output.scheduled_new_reqs:
+        if new_req.req_id == req_id:
+            return int(new_req.num_computed_tokens)
+
+    cached_reqs = scheduler_output.scheduled_cached_reqs
+    for index, cached_req_id in enumerate(cached_reqs.req_ids):
+        if cached_req_id == req_id:
+            return int(cached_reqs.num_computed_tokens[index])
+
+    raise ValueError(f"CP2PP4 scheduled request {req_id!r} has no request data")
+
+
+def _cp2pp4_scheduler_has_prompt_logprobs(
+    scheduler_output: SchedulerOutput,
+) -> bool:
+    for new_req in scheduler_output.scheduled_new_reqs:
+        sampling_params = new_req.sampling_params
+        if sampling_params is not None and sampling_params.prompt_logprobs is not None:
+            return True
+    return False
+
+
+def _validate_cp2pp4_pp_fast_path(
+    model_runner: Any,
+    parallel_config: Any,
+    scheduler_output: SchedulerOutput,
+    forward_pass: bool,
+    all_gather_tensors: dict[str, bool],
+) -> bool:
+    if not (
+        dsv4_cp2pp_fixed_shape_enabled()
+        and forward_pass
+        and parallel_config.pipeline_parallel_size > 1
+    ):
+        return False
+
+    num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+    if len(scheduler_output.num_scheduled_tokens) != 1:
+        raise ValueError(
+            "CP2PP4 supports one request, got "
+            f"{len(scheduler_output.num_scheduled_tokens)}"
+        )
+    if all_gather_tensors:
+        raise ValueError(
+            "CP2PP4 PP fast path does not support sequence-parallel all-gather"
+        )
+    if num_scheduled_tokens not in CP2PP4_SUPPORTED_CHUNK_SIZES:
+        raise ValueError(
+            "CP2PP4 only supports global chunk sizes "
+            f"{CP2PP4_SUPPORTED_CHUNK_SIZES}, got {num_scheduled_tokens}"
+        )
+    if model_runner.num_prompt_logprobs or _cp2pp4_scheduler_has_prompt_logprobs(
+        scheduler_output
+    ):
+        raise ValueError(
+            "CP2PP4 does not support prompt logprobs in the fixed-shape prototype"
+        )
+    if model_runner.routed_experts_initialized:
+        raise ValueError(
+            "CP2PP4 does not support routed-expert export in the fixed-shape prototype"
+        )
+
+    chunk_start = _get_cp2pp4_scheduler_chunk_start(scheduler_output)
+    if chunk_start % num_scheduled_tokens != 0:
+        raise ValueError(
+            f"CP2PP4 {num_scheduled_tokens}-token chunks must start on a "
+            f"{num_scheduled_tokens}-token boundary, got {chunk_start}"
+        )
+    return True
 
 
 def kernel_warmup(worker: "Worker") -> None:
@@ -191,11 +279,103 @@ class Worker(WorkerBase):
             raise ValueError(f"Unknown profiler type: {self.profiler_config.profiler}")
 
         self.use_v2_model_runner = vllm_config.use_v2_model_runner
-        # pending non-blocking PP send work from the previous iteration
-        self._pp_send_work: list[Handle] = []
+        # pending non-blocking PP send work and tensor refs
+        self._pp_send_work: list[tuple[list[Handle], tuple[torch.Tensor, ...]]] = []
+        self._pp_comm_stream: torch.cuda.Stream | None = None
 
         # Resolved lazily on first sleep/wake; persists worker-process state.
         self._sleep_mode_backend: SleepModeBackend | None = None
+
+    def _wait_pp_send_handles(
+        self,
+        handles: list[Handle],
+        tensors: tuple[torch.Tensor, ...],
+    ) -> None:
+        if not handles:
+            return
+
+        if any(getattr(tensor, "is_cuda", False) for tensor in tensors):
+            pp_comm_stream = self._get_pp_comm_stream()
+            with torch.cuda.stream(pp_comm_stream):
+                for handle in handles:
+                    handle.wait()
+            return
+
+        for handle in handles:
+            handle.wait()
+
+    def _sync_pp_comm_stream(self) -> None:
+        if self._pp_comm_stream is not None:
+            self._pp_comm_stream.synchronize()
+
+    def _wait_for_pp_send_work(self) -> None:
+        if self._pp_send_work:
+            for handles, tensors in self._pp_send_work:
+                self._wait_pp_send_handles(handles, tensors)
+        self._sync_pp_comm_stream()
+        self._pp_send_work = []
+
+    def _make_cp2pp4_pp_send_slot(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return torch.empty_like(hidden_states)
+
+    def _get_pp_comm_stream(self) -> torch.cuda.Stream:
+        if self._pp_comm_stream is None:
+            self._pp_comm_stream = torch.cuda.Stream(device=self.device)
+        return self._pp_comm_stream
+
+    def _make_cp2pp4_pp_intermediate_tensors(
+        self, num_scheduled_tokens: int
+    ) -> IntermediateTensors:
+        return self.model_runner.model.make_empty_intermediate_tensors(
+            batch_size=_cp2pp4_pp_recv_tokens(num_scheduled_tokens),
+            dtype=self.model_runner.dtype,
+            device=self.device,
+        )
+
+    def _irecv_cp2pp4_pp_hidden_states(
+        self, num_scheduled_tokens: int
+    ) -> AsyncIntermediateTensors:
+        intermediate_tensors = self._make_cp2pp4_pp_intermediate_tensors(
+            num_scheduled_tokens
+        )
+        hidden_states = intermediate_tensors["hidden_states"]
+        if not hidden_states.is_cuda:
+            handles = get_pp_group().irecv_tensor_into(hidden_states)
+            return AsyncIntermediateTensors(
+                intermediate_tensors.tensors, comm_handles=handles
+            )
+
+        recv_done = torch.cuda.Event()
+        comm_stream = self._get_pp_comm_stream()
+        with torch.cuda.stream(comm_stream):
+            handles = get_pp_group().irecv_tensor_into(hidden_states)
+            recv_done.record(comm_stream)
+
+        def _sync_recv_stream() -> None:
+            torch.cuda.current_stream(hidden_states.device).wait_event(recv_done)
+
+        return AsyncIntermediateTensors(
+            intermediate_tensors.tensors,
+            comm_handles=handles,
+            comm_postprocess=[_sync_recv_stream],
+        )
+
+    def _isend_cp2pp4_pp_hidden_states(self, hidden_states: torch.Tensor) -> None:
+        send_slot = self._make_cp2pp4_pp_send_slot(hidden_states)
+        if not hidden_states.is_cuda:
+            send_slot.copy_(hidden_states)
+            handles = get_pp_group().isend_tensor(send_slot)
+            self._pp_send_work.append((handles, (send_slot,)))
+            return
+
+        compute_done = torch.cuda.Event()
+        torch.cuda.current_stream(hidden_states.device).record_event(compute_done)
+        comm_stream = self._get_pp_comm_stream()
+        with torch.cuda.stream(comm_stream):
+            comm_stream.wait_event(compute_done)
+            send_slot.copy_(hidden_states, non_blocking=True)
+            handles = get_pp_group().isend_tensor(send_slot)
+        self._pp_send_work.append((handles, (send_slot,)))
 
     def _get_sleep_mode_backend(self) -> "SleepModeBackend":
         if self._sleep_mode_backend is None:
@@ -1068,19 +1248,12 @@ class Worker(WorkerBase):
     def execute_model(
         self, scheduler_output: "SchedulerOutput"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
-        # ensure any previous non-blocking PP sends are complete
-        if self._pp_send_work:
-            for handle in self._pp_send_work:
-                handle.wait()
-            self._pp_send_work = []
-
         intermediate_tensors = None
         forward_pass = scheduler_output.total_num_scheduled_tokens > 0
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         all_gather_tensors = {}
         compilation_config = self.vllm_config.compilation_config
         parallel_config = self.vllm_config.parallel_config
-
         if (
             parallel_config.pipeline_parallel_size > 1
             and compilation_config.pass_config.enable_sp
@@ -1110,19 +1283,38 @@ class Worker(WorkerBase):
                 )
             }
 
+        use_cp2pp4_pp_fast_path = _validate_cp2pp4_pp_fast_path(
+            self.model_runner,
+            parallel_config,
+            scheduler_output,
+            forward_pass,
+            all_gather_tensors,
+        )
+        if use_cp2pp4_pp_fast_path:
+            chunk_start = _get_cp2pp4_scheduler_chunk_start(scheduler_output)
+            if chunk_start == 0:
+                self._wait_for_pp_send_work()
+        else:
+            self._wait_for_pp_send_work()
+
         if forward_pass and not get_pp_group().is_first_rank:
-            tensor_dict, comm_handles, comm_postprocess = (
-                get_pp_group().irecv_tensor_dict(
-                    all_gather_group=get_tp_group(),
-                    all_gather_tensors=all_gather_tensors,
+            if use_cp2pp4_pp_fast_path:
+                intermediate_tensors = self._irecv_cp2pp4_pp_hidden_states(
+                    num_scheduled_tokens
                 )
-            )
-            assert tensor_dict is not None
-            intermediate_tensors = AsyncIntermediateTensors(
-                tensor_dict,
-                comm_handles=comm_handles,
-                comm_postprocess=comm_postprocess,
-            )
+            else:
+                tensor_dict, comm_handles, comm_postprocess = (
+                    get_pp_group().irecv_tensor_dict(
+                        all_gather_group=get_tp_group(),
+                        all_gather_tensors=all_gather_tensors,
+                    )
+                )
+                assert tensor_dict is not None
+                intermediate_tensors = AsyncIntermediateTensors(
+                    tensor_dict,
+                    comm_handles=comm_handles,
+                    comm_postprocess=comm_postprocess,
+                )
 
         with self.annotate_profile(scheduler_output):
             output = self.model_runner.execute_model(
@@ -1146,12 +1338,28 @@ class Worker(WorkerBase):
             and not get_pp_group().is_last_rank
         )
 
-        # launch non-blocking send of intermediate tensors
-        self._pp_send_work = get_pp_group().isend_tensor_dict(
-            output.tensors,
-            all_gather_group=get_tp_group(),
-            all_gather_tensors=all_gather_tensors,
-        )
+        if (
+            use_cp2pp4_pp_fast_path
+            and set(output.tensors) == {"hidden_states"}
+            and output.tensors["hidden_states"].numel() > 0
+        ):
+            self._isend_cp2pp4_pp_hidden_states(output.tensors["hidden_states"])
+        else:
+            self._wait_for_pp_send_work()
+            self._pp_send_work = [
+                (
+                    get_pp_group().isend_tensor_dict(
+                        output.tensors,
+                        all_gather_group=get_tp_group(),
+                        all_gather_tensors=all_gather_tensors,
+                    ),
+                    tuple(
+                        v
+                        for v in output.tensors.values()
+                        if isinstance(v, torch.Tensor)
+                    ),
+                )
+            ]
 
         return None
 

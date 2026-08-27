@@ -8,6 +8,7 @@ import pytest
 import torch
 from pydantic import ValidationError
 
+from vllm import envs
 from vllm.compilation.counter import compilation_counter
 from vllm.compilation.passes.utility.fix_functionalization import (
     FixFunctionalizationPass,
@@ -86,6 +87,161 @@ def test_custom_op():
 
     with pytest.raises(ValueError, match="Invalid syntax '"):
         _ = CompilationConfig(custom_ops=["quant_fp8"])
+
+
+def _make_dsv4_cp2pp4_config(
+    *,
+    enforce_eager: bool = True,
+    max_num_batched_tokens: int = 4096,
+    max_model_len: int = 32768,
+    tensor_parallel_size: int = 1,
+    pipeline_parallel_size: int = 4,
+    enable_expert_parallel: bool = False,
+    cudagraph_mode: CUDAGraphMode = CUDAGraphMode.NONE,
+    cudagraph_capture_sizes: list[int] | None = None,
+) -> VllmConfig:
+    vllm_config = object.__new__(VllmConfig)
+    vllm_config.model_config = MagicMock(
+        architecture="DeepseekV4ForCausalLM",
+        enforce_eager=enforce_eager,
+        max_model_len=max_model_len,
+    )
+    vllm_config.parallel_config = ParallelConfig(
+        tensor_parallel_size=tensor_parallel_size,
+        pipeline_parallel_size=pipeline_parallel_size,
+        prefill_context_parallel_size=2,
+        decode_context_parallel_size=1,
+        data_parallel_size=1,
+        enable_expert_parallel=enable_expert_parallel,
+    )
+    vllm_config.scheduler_config = SchedulerConfig(
+        max_num_seqs=1,
+        max_num_batched_tokens=max_num_batched_tokens,
+        max_model_len=max_model_len,
+        enable_chunked_prefill=True,
+        async_scheduling=False,
+        is_encoder_decoder=False,
+    )
+    vllm_config.cache_config = MagicMock(
+        enable_prefix_caching=False,
+        cache_dtype="fp8_ds_mla",
+    )
+    vllm_config.compilation_config = CompilationConfig(
+        cudagraph_mode=cudagraph_mode,
+        cudagraph_capture_sizes=cudagraph_capture_sizes or [],
+    )
+    vllm_config.speculative_config = None
+    return vllm_config
+
+
+def test_dsv4_cp2pp4_eager_config_still_allowed(monkeypatch):
+    monkeypatch.setattr(envs, "VLLM_DSV4_CP2PP4", True)
+    monkeypatch.setattr(envs, "VLLM_DSV4_CP2TP2PP2", False)
+
+    _make_dsv4_cp2pp4_config(enforce_eager=True)._verify_dsv4_cp2pp4()
+
+
+def test_dsv4_cp2tp2pp2_eager_config_allowed(monkeypatch):
+    monkeypatch.setattr(envs, "VLLM_DSV4_CP2PP4", False)
+    monkeypatch.setattr(envs, "VLLM_DSV4_CP2TP2PP2", True)
+
+    _make_dsv4_cp2pp4_config(
+        enforce_eager=True,
+        tensor_parallel_size=2,
+        pipeline_parallel_size=2,
+    )._verify_dsv4_cp2pp4()
+
+
+def test_dsv4_cp2tp2pp2_allows_benchmark_model_len_and_ep(monkeypatch):
+    monkeypatch.setattr(envs, "VLLM_DSV4_CP2PP4", False)
+    monkeypatch.setattr(envs, "VLLM_DSV4_CP2TP2PP2", True)
+
+    _make_dsv4_cp2pp4_config(
+        tensor_parallel_size=2,
+        pipeline_parallel_size=2,
+        max_model_len=65536,
+        enable_expert_parallel=True,
+    )._verify_dsv4_cp2pp4()
+
+
+@pytest.mark.parametrize(
+    ("tensor_parallel_size", "pipeline_parallel_size"),
+    [(1, 4), (1, 2), (2, 4), (4, 2)],
+)
+def test_dsv4_cp2tp2pp2_rejects_other_topologies(
+    monkeypatch, tensor_parallel_size, pipeline_parallel_size
+):
+    monkeypatch.setattr(envs, "VLLM_DSV4_CP2PP4", False)
+    monkeypatch.setattr(envs, "VLLM_DSV4_CP2TP2PP2", True)
+
+    config = _make_dsv4_cp2pp4_config(
+        tensor_parallel_size=tensor_parallel_size,
+        pipeline_parallel_size=pipeline_parallel_size,
+    )
+    with pytest.raises(ValueError, match="VLLM_DSV4_CP2TP2PP2"):
+        config._verify_dsv4_cp2pp4()
+
+
+def test_dsv4_cp2pp4_and_cp2tp2pp2_are_mutually_exclusive(monkeypatch):
+    monkeypatch.setattr(envs, "VLLM_DSV4_CP2PP4", True)
+    monkeypatch.setattr(envs, "VLLM_DSV4_CP2TP2PP2", True)
+
+    config = _make_dsv4_cp2pp4_config(
+        tensor_parallel_size=2,
+        pipeline_parallel_size=2,
+    )
+    with pytest.raises(ValueError, match="Set only one"):
+        config._verify_dsv4_cp2pp4()
+
+
+def test_dsv4_cp2pp4_cudagraph_requires_breakable(monkeypatch):
+    monkeypatch.setattr(envs, "VLLM_DSV4_CP2PP4", True)
+    monkeypatch.setattr(envs, "VLLM_USE_BREAKABLE_CUDAGRAPH", False)
+    vllm_config = _make_dsv4_cp2pp4_config(
+        enforce_eager=False,
+        cudagraph_mode=CUDAGraphMode.PIECEWISE,
+        cudagraph_capture_sizes=[2048],
+    )
+
+    with pytest.raises(ValueError, match="VLLM_USE_BREAKABLE_CUDAGRAPH=1"):
+        vllm_config._verify_dsv4_cp2pp4()
+
+
+def test_dsv4_cp2pp4_cudagraph_requires_piecewise(monkeypatch):
+    monkeypatch.setattr(envs, "VLLM_DSV4_CP2PP4", True)
+    monkeypatch.setattr(envs, "VLLM_USE_BREAKABLE_CUDAGRAPH", True)
+    vllm_config = _make_dsv4_cp2pp4_config(
+        enforce_eager=False,
+        cudagraph_mode=CUDAGraphMode.FULL,
+        cudagraph_capture_sizes=[2048],
+    )
+
+    with pytest.raises(ValueError, match="requires PIECEWISE CUDA graph"):
+        vllm_config._verify_dsv4_cp2pp4()
+
+
+def test_dsv4_cp2pp4_cudagraph_requires_local_chunk_capture(monkeypatch):
+    monkeypatch.setattr(envs, "VLLM_DSV4_CP2PP4", True)
+    monkeypatch.setattr(envs, "VLLM_USE_BREAKABLE_CUDAGRAPH", True)
+    vllm_config = _make_dsv4_cp2pp4_config(
+        enforce_eager=False,
+        cudagraph_mode=CUDAGraphMode.PIECEWISE,
+        cudagraph_capture_sizes=[4096],
+    )
+
+    with pytest.raises(ValueError, match="local chunk size 2048"):
+        vllm_config._verify_dsv4_cp2pp4()
+
+
+def test_dsv4_cp2pp4_cudagraph_config_allowed(monkeypatch):
+    monkeypatch.setattr(envs, "VLLM_DSV4_CP2PP4", True)
+    monkeypatch.setattr(envs, "VLLM_USE_BREAKABLE_CUDAGRAPH", True)
+
+    _make_dsv4_cp2pp4_config(
+        enforce_eager=False,
+        cudagraph_mode=CUDAGraphMode.PIECEWISE,
+        cudagraph_capture_sizes=[2048],
+    )._verify_dsv4_cp2pp4()
 
 
 # forked needed to workaround https://github.com/vllm-project/vllm/issues/21073

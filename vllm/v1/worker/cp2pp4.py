@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Fixed-shape helpers for the experimental DeepSeek-V4 CP2 x PP4 path."""
+"""Fixed-shape helpers for experimental DeepSeek-V4 CP2 PP paths."""
 
 from dataclasses import dataclass
 
 import numpy as np
+
+import vllm.envs as envs
 
 CP2PP4_CHUNK_SIZE = 2048
 CP2PP4_SUPPORTED_CHUNK_SIZES = (CP2PP4_CHUNK_SIZE, 4096)
@@ -18,6 +20,18 @@ class CP2PP4ChunkShard:
 
     local_indices: np.ndarray
     global_positions: np.ndarray
+
+
+def dsv4_cp2pp_fixed_shape_enabled() -> bool:
+    return envs.VLLM_DSV4_CP2PP4 or envs.VLLM_DSV4_CP2TP2PP2
+
+
+def dsv4_cp2pp_fixed_shape_name() -> str:
+    if envs.VLLM_DSV4_CP2PP4 and envs.VLLM_DSV4_CP2TP2PP2:
+        return "VLLM_DSV4_CP2PP4+VLLM_DSV4_CP2TP2PP2"
+    if envs.VLLM_DSV4_CP2TP2PP2:
+        return "VLLM_DSV4_CP2TP2PP2"
+    return "VLLM_DSV4_CP2PP4"
 
 
 def get_cp2pp4_local_tokens(chunk_size: int) -> int:

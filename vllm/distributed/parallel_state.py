@@ -1115,6 +1115,59 @@ class GroupCoordinator:
 
         return handles
 
+    def isend_tensor(
+        self, tensor: torch.Tensor, dst: int | None = None
+    ) -> list[Handle]:
+        """Metadata-free async send for a single fixed-shape tensor.
+
+        NOTE: `dst` is the local rank of the destination rank.
+        """
+        if self.world_size <= 1:
+            return []
+
+        if dst is None:
+            dst = (self.rank_in_group + 1) % self.world_size
+        assert dst < self.world_size, f"Invalid dst rank ({dst})"
+
+        if self.use_cpu_custom_send_recv:
+            if self.device_communicator is None:
+                raise ValueError("No device communicator found")
+            self.device_communicator.send(tensor, dst)
+            return []
+
+        comm_group = self.cpu_group if tensor.is_cpu else self.device_group
+        handle = torch.distributed.isend(tensor, dst=self.ranks[dst], group=comm_group)
+        if tensor.is_cuda:
+            tensor.record_stream(torch.cuda.current_stream(tensor.device))
+        return [handle]
+
+    def irecv_tensor_into(
+        self, tensor: torch.Tensor, src: int | None = None
+    ) -> list[Handle]:
+        """Metadata-free async receive into an existing fixed-shape tensor.
+
+        NOTE: `src` is the local rank of the source rank.
+        """
+        if not torch.distributed.is_initialized() or self.world_size == 1:
+            return []
+
+        if src is None:
+            src = (self.rank_in_group - 1) % self.world_size
+        assert src < self.world_size, f"Invalid src rank ({src})"
+
+        if self.use_cpu_custom_send_recv:
+            if self.device_communicator is None:
+                raise ValueError("No device communicator found")
+            received = self.device_communicator.recv(tensor.size(), tensor.dtype, src)
+            tensor.copy_(received)
+            return []
+
+        comm_group = self.cpu_group if tensor.is_cpu else self.device_group
+        handle = torch.distributed.irecv(tensor, src=self.ranks[src], group=comm_group)
+        if tensor.is_cuda:
+            tensor.record_stream(torch.cuda.current_stream(tensor.device))
+        return [handle]
+
     def recv_tensor_dict(
         self,
         src: int | None = None,

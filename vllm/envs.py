@@ -68,6 +68,7 @@ if TYPE_CHECKING:
     VLLM_USE_B12X_WO_PROJECTION: bool = False
     VLLM_USE_B12X_MOE: bool = False
     VLLM_DSV4_CP2PP4: bool = False
+    VLLM_DSV4_CP2TP2PP2: bool = False
     VLLM_NF3_GRID188_DECODE: bool = True
     VLLM_USE_B12X_MINIMAX_M3_MSA: bool = False
     VLLM_USE_B12X_DCP_A2A: bool = False
@@ -239,6 +240,7 @@ if TYPE_CHECKING:
     VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE: str = "84KB"
     VLLM_PCIE_ONESHOT_FUSED_ADD_RMS_NORM_MAX_SIZE: str = "84KB"
     VLLM_PCIE_DMA_MIN_BYTES: str = "6MB"
+    VLLM_PCIE_DMA_DEDICATED_STREAM: bool = False
     VLLM_PCIE_ONESHOT_ALLOW_CROSS_NUMA: bool = True
     VLLM_PCIE_ONESHOT_SINGLE_CHANNEL: bool = False
     VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE: int = 394 * 1024 * 1024
@@ -1125,9 +1127,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Experimental fixed-shape DeepSeek-V4 prototype: PCP2 x PP4, one
     # request, and aligned 2048-token prefill chunks. This is intentionally
     # opt-in while the cache exchange and scheduler restrictions are narrow.
-    "VLLM_DSV4_CP2PP4": lambda: bool(
-        int(os.getenv("VLLM_DSV4_CP2PP4", "0"))
-    ),
+    "VLLM_DSV4_CP2PP4": lambda: bool(int(os.getenv("VLLM_DSV4_CP2PP4", "0"))),
+    # Experimental fixed-shape DeepSeek-V4 prototype: PCP2 x TP2 x PP2.
+    # Shares the CP2PP4 fixed-shape scheduler/cache/PP restrictions.
+    "VLLM_DSV4_CP2TP2PP2": lambda: bool(int(os.getenv("VLLM_DSV4_CP2TP2PP2", "0"))),
     "VLLM_NVFP4_MLA_DYNAMIC_SCALE": lambda: bool(
         int(os.getenv("VLLM_NVFP4_MLA_DYNAMIC_SCALE", "0"))
     ),
@@ -1875,6 +1878,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Whitespace is ignored. "off", "disabled", and "none" disable DMA.
     # A deployment preflight may override this with a measured crossover.
     "VLLM_PCIE_DMA_MIN_BYTES": lambda: os.getenv("VLLM_PCIE_DMA_MIN_BYTES", "6MB"),
+    # Experimental: dispatch eager B12X DMA all-reduce on a persistent comm
+    # stream while preserving the synchronous tensor-model-parallel contract.
+    "VLLM_PCIE_DMA_DEDICATED_STREAM": lambda: bool(
+        int(os.getenv("VLLM_PCIE_DMA_DEDICATED_STREAM", "0"))
+    ),
     # Allow the b12x PCIe oneshot allreduce on cross-NUMA PCIe topologies.
     "VLLM_PCIE_ONESHOT_ALLOW_CROSS_NUMA": lambda: (
         os.getenv("VLLM_PCIE_ONESHOT_ALLOW_CROSS_NUMA", "1") != "0"
@@ -2299,7 +2307,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Prebuilt exllamav3 extension location and torch-ABI compatibility shim.
     "VLLM_EXL3_EXT_PATH": lambda: os.getenv("VLLM_EXL3_EXT_PATH"),
     "VLLM_EXL3_ABI_SHIM": lambda: os.getenv("VLLM_EXL3_ABI_SHIM"),
-
 }
 
 

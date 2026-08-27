@@ -5,7 +5,6 @@ from typing import ClassVar, cast
 
 import torch
 
-import vllm.envs as envs
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.platforms import current_platform
@@ -28,6 +27,7 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowMLASpec,
     get_kv_quant_mode,
 )
+from vllm.v1.worker.cp2pp4 import dsv4_cp2pp_fixed_shape_enabled
 
 # DeepseekV4 decode layer types, keyed by compress_ratio. Each type has a distinct
 # (topk, extra_topk, extra_page_block_size) config, so they cannot share a
@@ -97,7 +97,7 @@ class DeepseekV4SWACache(torch.nn.Module, AttentionLayerBase):
             alignment=576 if uses_fp8_ds_mla_layout else 512,
             model_version="deepseek_v4",
             kv_quant_mode=get_kv_quant_mode(self.cache_config.cache_dtype),
-            dcp_replicated=envs.VLLM_DSV4_CP2PP4,
+            dcp_replicated=dsv4_cp2pp_fixed_shape_enabled(),
         )
 
     def forward(self): ...
@@ -453,7 +453,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         block_table = common_attn_metadata.block_table_tensor
         slot_mapping = common_attn_metadata.slot_mapping
         explicit_positions = common_attn_metadata.positions
-        if envs.VLLM_DSV4_CP2PP4 and (
+        if dsv4_cp2pp_fixed_shape_enabled() and (
             num_reqs != 1 or explicit_positions is None
         ):
             raise RuntimeError(
@@ -726,7 +726,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
                 self.window_size,
                 BLOCK_SIZE=triton.next_power_of_2(num_prefills),
             )
-            if envs.VLLM_DSV4_CP2PP4:
+            if dsv4_cp2pp_fixed_shape_enabled():
                 pfx_gather_lens.copy_(seq_lens[num_decodes:])
 
             result["prefill_seq_lens"] = seq_lens[num_decodes:]

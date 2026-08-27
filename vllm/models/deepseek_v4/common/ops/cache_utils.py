@@ -452,6 +452,8 @@ def compute_global_topk_indices_and_lens(
         token_to_req_indices,
         block_table,
         block_table.stride(0),
+        block_table.shape[0],
+        block_table.shape[-1],
         block_size,
         is_valid_token,
         TRITON_BLOCK_SIZE=1024,
@@ -483,6 +485,8 @@ def compute_dcp_global_topk_indices_and_lens(
         token_to_req_indices,
         block_table,
         block_table.stride(0),
+        block_table.shape[0],
+        block_table.shape[-1],
         block_size,
         is_valid_token,
         DCP_WORLD_SIZE=dcp_world_size,
@@ -504,6 +508,8 @@ def _compute_global_topk_indices_and_lens_kernel(
     token_to_req_indices_ptr,
     block_table_ptr,
     block_table_stride,
+    max_reqs,
+    max_blocks_per_seq,
     block_size,
     is_valid_token_ptr,
     TRITON_BLOCK_SIZE: tl.constexpr,
@@ -511,7 +517,8 @@ def _compute_global_topk_indices_and_lens_kernel(
     token_idx = tl.program_id(0)
     is_valid_token = tl.load(is_valid_token_ptr + token_idx)
     req_idx = tl.load(token_to_req_indices_ptr + token_idx)
-    safe_req_idx = tl.where(is_valid_token, req_idx, 0)
+    is_valid_req = is_valid_token & (req_idx >= 0) & (req_idx < max_reqs)
+    safe_req_idx = tl.where(is_valid_req, req_idx, 0)
 
     count = tl.zeros((), dtype=tl.int32)
     for i in range(0, topk, TRITON_BLOCK_SIZE):
@@ -526,9 +533,17 @@ def _compute_global_topk_indices_and_lens_kernel(
         is_valid = local_idx >= 0
 
         block_indices = local_idx // block_size
+        is_valid = (
+            is_valid
+            & is_valid_req
+            & (block_indices >= 0)
+            & (block_indices < max_blocks_per_seq)
+        )
+        safe_block_indices = tl.where(is_valid, block_indices, 0)
         block_numbers = tl.load(
-            block_table_ptr + safe_req_idx * block_table_stride + block_indices,
+            block_table_ptr + safe_req_idx * block_table_stride + safe_block_indices,
             mask=mask & is_valid,
+            other=0,
         )
         block_offsets = local_idx % block_size
 
@@ -556,6 +571,8 @@ def _compute_dcp_global_topk_indices_and_lens_kernel(
     token_to_req_indices_ptr,
     block_table_ptr,
     block_table_stride,
+    max_reqs,
+    max_blocks_per_seq,
     block_size,
     is_valid_token_ptr,
     DCP_WORLD_SIZE: tl.constexpr,
@@ -566,7 +583,8 @@ def _compute_dcp_global_topk_indices_and_lens_kernel(
     token_idx = tl.program_id(0)
     is_valid_token = tl.load(is_valid_token_ptr + token_idx)
     req_idx = tl.load(token_to_req_indices_ptr + token_idx)
-    safe_req_idx = tl.where(is_valid_token, req_idx, 0)
+    is_valid_req = is_valid_token & (req_idx >= 0) & (req_idx < max_reqs)
+    safe_req_idx = tl.where(is_valid_req, req_idx, 0)
 
     count = tl.zeros((), dtype=tl.int32)
     virtual_block_size = block_size * DCP_WORLD_SIZE
@@ -582,9 +600,17 @@ def _compute_dcp_global_topk_indices_and_lens_kernel(
         valid_local = local_idx >= 0
 
         block_indices = local_idx // virtual_block_size
+        valid_block = (
+            valid_local
+            & is_valid_req
+            & (block_indices >= 0)
+            & (block_indices < max_blocks_per_seq)
+        )
+        safe_block_indices = tl.where(valid_block, block_indices, 0)
         block_numbers = tl.load(
-            block_table_ptr + safe_req_idx * block_table_stride + block_indices,
-            mask=offset_mask & valid_local,
+            block_table_ptr + safe_req_idx * block_table_stride + safe_block_indices,
+            mask=offset_mask & valid_block,
+            other=0,
         ).to(tl.int64)
 
         virtual_block_offsets = local_idx - block_indices * virtual_block_size
@@ -598,7 +624,7 @@ def _compute_dcp_global_topk_indices_and_lens_kernel(
         )
 
         slot_ids = block_numbers * block_size + local_block_offsets
-        valid = offset_mask & valid_local & is_local & is_valid_token
+        valid = offset_mask & valid_block & is_local & is_valid_token
         compact_pos = count + tl.cumsum(valid.to(tl.int32), 0) - 1
         row_base = global_topk_indices_ptr + token_idx * global_topk_indices_stride
         tl.store(row_base + offset, -1, mask=offset_mask)

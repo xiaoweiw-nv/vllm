@@ -984,16 +984,30 @@ class VllmConfig:
         )
 
     def _verify_dsv4_cp2pp4(self) -> None:
-        if not envs.VLLM_DSV4_CP2PP4:
+        cp2pp4 = envs.VLLM_DSV4_CP2PP4
+        cp2tp2pp2 = envs.VLLM_DSV4_CP2TP2PP2
+        if not (cp2pp4 or cp2tp2pp2):
             return
+        if cp2pp4 and cp2tp2pp2:
+            raise ValueError("Set only one of VLLM_DSV4_CP2PP4 or VLLM_DSV4_CP2TP2PP2")
         if self.model_config is None:
-            raise ValueError("VLLM_DSV4_CP2PP4 requires a model configuration")
+            raise ValueError(
+                "DeepSeek-V4 fixed CP2 PP path requires a model configuration"
+            )
 
         parallel = self.parallel_config
         scheduler = self.scheduler_config
+        if cp2tp2pp2:
+            mode = "VLLM_DSV4_CP2TP2PP2"
+            expected_tp = 2
+            expected_pp = 2
+        else:
+            mode = "VLLM_DSV4_CP2PP4"
+            expected_tp = 1
+            expected_pp = 4
         checks = {
-            "tensor_parallel_size": (parallel.tensor_parallel_size, 1),
-            "pipeline_parallel_size": (parallel.pipeline_parallel_size, 4),
+            "tensor_parallel_size": (parallel.tensor_parallel_size, expected_tp),
+            "pipeline_parallel_size": (parallel.pipeline_parallel_size, expected_pp),
             "prefill_context_parallel_size": (
                 parallel.prefill_context_parallel_size,
                 2,
@@ -1012,36 +1026,61 @@ class VllmConfig:
         ]
         if mismatches:
             raise ValueError(
-                "VLLM_DSV4_CP2PP4 fixed-shape configuration mismatch: "
-                + ", ".join(mismatches)
+                f"{mode} fixed-shape configuration mismatch: " + ", ".join(mismatches)
             )
         if scheduler.max_num_batched_tokens not in (2048, 4096):
             raise ValueError(
-                "VLLM_DSV4_CP2PP4 requires max_num_batched_tokens in "
+                f"{mode} requires max_num_batched_tokens in "
                 f"(2048, 4096), got {scheduler.max_num_batched_tokens}"
             )
         architecture = self.model_config.architecture or ""
         if "DeepseekV4" not in architecture:
             raise ValueError(
-                "VLLM_DSV4_CP2PP4 only supports DeepSeek-V4, "
-                f"got architecture={architecture!r}"
+                f"{mode} only supports DeepSeek-V4, got architecture={architecture!r}"
             )
-        if parallel.enable_expert_parallel:
-            raise ValueError("VLLM_DSV4_CP2PP4 requires expert parallelism disabled")
+        if cp2pp4 and parallel.enable_expert_parallel:
+            raise ValueError(f"{mode} requires expert parallelism disabled")
         if self.cache_config.enable_prefix_caching:
-            raise ValueError("VLLM_DSV4_CP2PP4 requires prefix caching disabled")
+            raise ValueError(f"{mode} requires prefix caching disabled")
         if self.cache_config.cache_dtype != "fp8_ds_mla":
-            raise ValueError(
-                "VLLM_DSV4_CP2PP4 requires --kv-cache-dtype fp8_ds_mla"
-            )
+            raise ValueError(f"{mode} requires --kv-cache-dtype fp8_ds_mla")
         if not scheduler.enable_chunked_prefill:
-            raise ValueError("VLLM_DSV4_CP2PP4 requires chunked prefill enabled")
+            raise ValueError(f"{mode} requires chunked prefill enabled")
         if scheduler.async_scheduling:
-            raise ValueError("VLLM_DSV4_CP2PP4 requires async scheduling disabled")
+            raise ValueError(f"{mode} requires async scheduling disabled")
         if self.speculative_config is not None:
-            raise ValueError("VLLM_DSV4_CP2PP4 does not support speculative decoding")
+            raise ValueError(f"{mode} does not support speculative decoding")
         if not self.model_config.enforce_eager:
-            raise ValueError("VLLM_DSV4_CP2PP4 currently requires eager execution")
+            local_chunk_tokens = (
+                scheduler.max_num_batched_tokens
+                // parallel.prefill_context_parallel_size
+            )
+            if (
+                scheduler.max_num_batched_tokens
+                % parallel.prefill_context_parallel_size
+            ):
+                raise ValueError(
+                    f"{mode} requires max_num_batched_tokens divisible "
+                    "by prefill_context_parallel_size for CUDA graph capture"
+                )
+            if not envs.VLLM_USE_BREAKABLE_CUDAGRAPH:
+                raise ValueError(
+                    f"{mode} non-eager execution requires "
+                    "VLLM_USE_BREAKABLE_CUDAGRAPH=1"
+                )
+            if not self.compilation_config.cudagraph_mode.has_piecewise_cudagraphs():
+                raise ValueError(
+                    f"{mode} non-eager execution requires PIECEWISE CUDA graph mode"
+                )
+            if (
+                local_chunk_tokens
+                not in self.compilation_config.cudagraph_capture_sizes
+            ):
+                raise ValueError(
+                    f"{mode} non-eager execution requires "
+                    f"cudagraph_capture_sizes to include local chunk size "
+                    f"{local_chunk_tokens}"
+                )
 
     def __post_init__(self):
         """Verify configs are valid & consistent with each other."""

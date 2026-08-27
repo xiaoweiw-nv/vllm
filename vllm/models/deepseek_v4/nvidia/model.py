@@ -750,7 +750,7 @@ class DeepseekV4MoE(nn.Module):
             router_logits_dtype=torch.float32,
             enable_eplb=parallel_config.enable_eplb,
             num_redundant_experts=eplb_config.num_redundant_experts,
-            pcp_size=1 if envs.VLLM_DSV4_CP2PP4 else None,
+            pcp_size=(1 if envs.VLLM_DSV4_CP2PP4 or envs.VLLM_DSV4_CP2TP2PP2 else None),
         )
         self.n_local_experts = self.experts.expert_map_manager.local_num_experts
         self.experts_start_idx = 0
@@ -1574,9 +1574,17 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         # of shape (num_tokens, hc_mult, hidden_size) — V4 expands the
         # token embedding to hc_mult streams before the first decoder
         # layer and keeps that shape until hc_head() collapses it.
+        # In the fixed CP2 PP path this buffer is immediately filled by
+        # an irecv posted on the PP comm stream. torch.zeros would enqueue a
+        # default-stream memset that can race the comm-stream recv.
+        allocate = (
+            torch.empty
+            if envs.VLLM_DSV4_CP2PP4 or envs.VLLM_DSV4_CP2TP2PP2
+            else torch.zeros
+        )
         return IntermediateTensors(
             {
-                "hidden_states": torch.zeros(
+                "hidden_states": allocate(
                     (batch_size, self.hc_mult, self.config.hidden_size),
                     dtype=dtype,
                     device=device,
