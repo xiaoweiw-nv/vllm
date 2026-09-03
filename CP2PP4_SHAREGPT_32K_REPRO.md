@@ -36,22 +36,31 @@ The measured container had this software stack:
 | NVIDIA driver | `580.95.05` |
 | PyTorch | `2.12.0+cu132` |
 | vLLM package | `0.11.2.dev280+gilded.gnosis.v20.vllmfa13d33.b12xacee6e5.fi1ac6942.cu132.20260807.r31` plus commit `f944ad32` |
-| FlashInfer | `0.6.14`, fork `voipmonitor/flashinfer`, branch `integration/main-pr4393-pcie-ipc-qualified-20260807`, commit `1ac6942776b383c6b03c7a5805a22e72a3e3349f` |
-| DeepGEMM | `2.5.0+a6b593d`, repo `deepseek-ai/DeepGEMM`, pinned ref/commit `a6b593d2826719dcf4892609af7b84ee23aaf32a` (not current `main`) |
+| FlashInfer | `0.6.14`; practical source rebuild uses fork `lucifer1004/flashinfer`, commit `1ea26f54424911e86669031d477a74d3a0189807` |
+| DeepGEMM | `2.5.0+a6b593d`, fork `leavelet/DeepGEMM`, pinned commit `a6b593d2826719dcf4892609af7b84ee23aaf32a` |
 | NCCL | patched `2.30.4`, loaded from `/opt/libnccl-local-inference.so.2.30.4` |
 | CUTLASS DSL | `4.6.0` |
 | Triton | `3.7.0` |
 
-These repository, ref, and commit pins come from the immutable r31 image-build
-recipe. Do not substitute current upstream `main`:
+These repository and commit pins come from the r31 benchmark stack provenance.
+Do not substitute current upstream `main`:
 
 ```bash
-git clone https://github.com/voipmonitor/flashinfer.git
-git -C flashinfer checkout 1ac6942776b383c6b03c7a5805a22e72a3e3349f
+git clone https://github.com/lucifer1004/flashinfer.git
+git -C flashinfer checkout 1ea26f54424911e86669031d477a74d3a0189807
 
-git clone https://github.com/deepseek-ai/DeepGEMM.git
+git clone https://github.com/leavelet/DeepGEMM.git
 git -C DeepGEMM checkout a6b593d2826719dcf4892609af7b84ee23aaf32a
 ```
+
+The final measured image was not a byte-identical plain source install:
+`flashinfer-python` reported version `0.6.14`, while the MoE EP path came from
+the `lucifer1004/flashinfer` fork at `1ea26f54424911e86669031d477a74d3a0189807`
+with later bootstrap/group_src and greentrace shim patches. Use that commit as
+the closest practical source rebuild anchor. The newer fork hashes
+`91c8c78758b9ca1c37cf404c533f84f7863484d7` for DeepGEMM and
+`8c765a04c1ad721ebd2f1e57d169cfbd6a9deb7c` for FlashInfer postdate the tested
+stack and should not be used for this reproduction unless revalidated.
 
 The tested local image identity was
 `sha256:067980e7f7ae7b9512445f6da38ffff74846707ff45d2d0184709030a9d82faa`.
