@@ -36,16 +36,17 @@ The measured container had this software stack:
 | NVIDIA driver | `580.95.05` |
 | PyTorch | `2.12.0+cu132` |
 | vLLM package | `0.11.2.dev280+gilded.gnosis.v20.vllmfa13d33.b12xacee6e5.fi1ac6942.cu132.20260807.r31` plus commit `f944ad32` |
-| FlashInfer | `0.6.14`, commit `1ac6942776b383c6b03c7a5805a22e72a3e3349f` |
-| DeepGEMM | `2.5.0+a6b593d`, commit `a6b593d2826719dcf4892609af7b84ee23aaf32a` |
+| FlashInfer | `0.6.14`, fork `voipmonitor/flashinfer`, branch `integration/main-pr4393-pcie-ipc-qualified-20260807`, commit `1ac6942776b383c6b03c7a5805a22e72a3e3349f` |
+| DeepGEMM | `2.5.0+a6b593d`, repo `deepseek-ai/DeepGEMM`, pinned ref/commit `a6b593d2826719dcf4892609af7b84ee23aaf32a` (not current `main`) |
 | NCCL | patched `2.30.4`, loaded from `/opt/libnccl-local-inference.so.2.30.4` |
 | CUTLASS DSL | `4.6.0` |
 | Triton | `3.7.0` |
 
-FlashInfer and DeepGEMM commits are fetchable from their public repositories:
+These repository, ref, and commit pins come from the immutable r31 image-build
+recipe. Do not substitute current upstream `main`:
 
 ```bash
-git clone https://github.com/flashinfer-ai/flashinfer.git
+git clone https://github.com/voipmonitor/flashinfer.git
 git -C flashinfer checkout 1ac6942776b383c6b03c7a5805a22e72a3e3349f
 
 git clone https://github.com/deepseek-ai/DeepGEMM.git
