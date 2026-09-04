@@ -124,6 +124,7 @@ MoEBackend = Literal[
     "triton",
     "deep_gemm",
     "deep_gemm_mega_moe",
+    "flashinfer_mega_moe",
     "b12x",
     "cutlass",
     "flashinfer_trtllm",
@@ -190,6 +191,7 @@ class KernelConfig:
     - "triton": Use Triton-based fused MoE kernels
     - "deep_gemm": Use DeepGEMM kernels (FP8 block-quantized only)
     - "deep_gemm_mega_moe": Use DeepGEMM mega MoE kernels
+    - "flashinfer_mega_moe": Use FlashInfer fused expert-parallel MegaMoE kernels
     - "b12x": Use B12X kernels for Blackwell FP4 MoE
     - "cutlass": Use vLLM CUTLASS kernels
     - "flashinfer_trtllm": Use FlashInfer with TRTLLM-GEN kernels

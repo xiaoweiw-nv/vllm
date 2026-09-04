@@ -1038,8 +1038,15 @@ class VllmConfig:
             raise ValueError(
                 f"{mode} only supports DeepSeek-V4, got architecture={architecture!r}"
             )
-        if cp2pp4 and parallel.enable_expert_parallel:
+        if cp2tp2pp2 and parallel.enable_expert_parallel:
             raise ValueError(f"{mode} requires expert parallelism disabled")
+        if cp2pp4 and parallel.enable_expert_parallel:
+            if self.kernel_config.moe_backend != "flashinfer_mega_moe":
+                raise ValueError(
+                    f"{mode} only supports expert parallelism with "
+                    "--moe-backend flashinfer_mega_moe"
+                )
+            self._verify_dsv4_cp2ep2pp4_groups(mode)
         if self.cache_config.enable_prefix_caching:
             raise ValueError(f"{mode} requires prefix caching disabled")
         if self.cache_config.cache_dtype != "fp8_ds_mla":
@@ -1081,6 +1088,44 @@ class VllmConfig:
                     f"cudagraph_capture_sizes to include local chunk size "
                     f"{local_chunk_tokens}"
                 )
+
+    def _verify_dsv4_cp2ep2pp4_groups(self, mode: str) -> None:
+        """Require CP2EP2PP4 to overlay EP groups exactly on PCP groups."""
+        parallel = self.parallel_config
+        world_size = (
+            parallel.data_parallel_size
+            * parallel.pipeline_parallel_size
+            * parallel.prefill_context_parallel_size
+            * parallel.tensor_parallel_size
+        )
+        all_ranks = torch.arange(world_size).reshape(
+            -1,
+            parallel.data_parallel_size,
+            parallel.pipeline_parallel_size,
+            parallel.prefill_context_parallel_size,
+            parallel.tensor_parallel_size,
+        )
+        pcp_groups = (
+            all_ranks.transpose(3, 4)
+            .reshape(-1, parallel.prefill_context_parallel_size)
+            .tolist()
+        )
+        ep_world_size = (
+            parallel.data_parallel_size
+            * parallel.prefill_context_parallel_size
+            * parallel.tensor_parallel_size
+        )
+        ep_groups = all_ranks.transpose(1, 2).reshape(-1, ep_world_size).tolist()
+        if ep_world_size != 2 or ep_groups != pcp_groups:
+            raise ValueError(
+                f"{mode} with expert parallelism requires EP groups to "
+                "coincide with PCP pairs; got "
+                f"data_parallel_size={parallel.data_parallel_size}, "
+                f"tensor_parallel_size={parallel.tensor_parallel_size}, "
+                f"pipeline_parallel_size={parallel.pipeline_parallel_size}, "
+                "prefill_context_parallel_size="
+                f"{parallel.prefill_context_parallel_size}"
+            )
 
     def __post_init__(self):
         """Verify configs are valid & consistent with each other."""

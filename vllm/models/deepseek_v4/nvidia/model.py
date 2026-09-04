@@ -77,6 +77,11 @@ from vllm.models.deepseek_v4.nvidia.flashinfer_sparse import (
     DeepseekV4FlashInferMLAAttention,
     DeepseekV4FlashInferSM120Attention,
 )
+from vllm.models.deepseek_v4.nvidia.flashinfer_mega_moe import (
+    FLASHINFER_MEGA_MOE_BACKEND,
+    DeepseekV4FlashInferMegaMoEAdapter,
+    is_mega_moe_backend,
+)
 from vllm.models.deepseek_v4.nvidia.flashmla import DeepseekV4FlashMLAAttention
 from vllm.models.deepseek_v4.nvidia.ops.prepare_megamoe import prepare_megamoe_inputs
 from vllm.platforms import current_platform
@@ -253,6 +258,7 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
         self.max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+        self.mega_moe_backend = vllm_config.kernel_config.moe_backend
 
         self.num_logical_experts = (
             num_logical_experts if num_logical_experts is not None else num_experts
@@ -309,6 +315,21 @@ class DeepseekV4MegaMoEExperts(nn.Module):
 
         self._transformed_l1_weights: tuple[torch.Tensor, torch.Tensor] | None = None
         self._transformed_l2_weights: tuple[torch.Tensor, torch.Tensor] | None = None
+        self._flashinfer_adapter = (
+            DeepseekV4FlashInferMegaMoEAdapter(
+                num_experts=num_experts,
+                num_local_experts=num_local_experts,
+                top_k=top_k,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                max_num_tokens=self.max_num_tokens,
+                activation_clamp=getattr(
+                    vllm_config.model_config.hf_config, "swiglu_limit", None
+                ),
+            )
+            if self.mega_moe_backend == FLASHINFER_MEGA_MOE_BACKEND
+            else None
+        )
 
         # Register in the static forward context so the custom-op wrapper
         # can look up this module by name from within a torch.compile graph.
@@ -375,6 +396,9 @@ class DeepseekV4MegaMoEExperts(nn.Module):
 
     def _check_runtime_supported(self) -> None:
         device = self.w13_weight.device
+        if self._flashinfer_adapter is not None:
+            self._flashinfer_adapter.check_runtime_supported(device)
+            return
         if torch.cuda.get_device_capability(device)[0] != 10:
             raise NotImplementedError("DeepGEMM MegaMoE requires SM100 GPUs.")
         if self.hidden_size % 128 != 0 or self.intermediate_size % 128 != 0:
@@ -384,6 +408,21 @@ class DeepseekV4MegaMoEExperts(nn.Module):
             )
 
     def finalize_weights(self) -> None:
+        if self._flashinfer_adapter is not None:
+            if self._flashinfer_adapter.is_finalized:
+                return
+            self._check_runtime_supported()
+            self._flashinfer_adapter.finalize_weights(
+                self.w13_weight.data,
+                self.w2_weight.data,
+                self.w13_weight_scale.data,
+                self.w2_weight_scale.data,
+            )
+            self.w13_weight = None
+            self.w13_weight_scale = None
+            self.w2_weight = None
+            self.w2_weight_scale = None
+            return
         if self._transformed_l1_weights is not None:
             return
 
@@ -467,6 +506,10 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         )
 
     def get_expert_weights(self) -> list[torch.Tensor]:
+        if self._flashinfer_adapter is not None:
+            raise NotImplementedError(
+                "flashinfer_mega_moe does not yet support EPLB weight migration"
+            )
         self.finalize_weights()
         assert self._transformed_l1_weights is not None
         assert self._transformed_l2_weights is not None
@@ -512,13 +555,6 @@ class DeepseekV4MegaMoEExperts(nn.Module):
                 f"DeepSeek V4 MegaMoE got {hidden_states.shape[0]} tokens, "
                 f"but the symmetric buffer was sized for {self.max_num_tokens}."
             )
-        y = torch.empty_like(hidden_states, dtype=torch.bfloat16)
-
-        from vllm.utils.deep_gemm import _import_deep_gemm
-
-        deep_gemm = _import_deep_gemm()
-
-        symm_buffer = self.get_symm_buffer()
         num_tokens = hidden_states.shape[0]
         is_padding = None
         if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
@@ -547,6 +583,39 @@ class DeepseekV4MegaMoEExperts(nn.Module):
                 else None,
             )
 
+        if self._flashinfer_adapter is not None:
+            if is_padding is not None:
+                topk_weights = torch.where(
+                    is_padding.unsqueeze(1),
+                    torch.zeros(
+                        (), dtype=topk_weights.dtype, device=topk_weights.device
+                    ),
+                    topk_weights,
+                )
+            self.finalize_weights()
+            output = self._flashinfer_adapter.output_buffer
+            torch.ops.vllm.deepseek_v4_flashinfer_mega_moe_stage(
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                output,
+                self.prefix,
+                activation_clamp,
+            )
+            torch.ops.vllm.deepseek_v4_flashinfer_mega_moe_compute(
+                output,
+                self.prefix,
+            )
+            return output[:num_tokens]
+
+        y = torch.empty_like(hidden_states, dtype=torch.bfloat16)
+
+        from vllm.utils.deep_gemm import _import_deep_gemm
+
+        deep_gemm = _import_deep_gemm()
+
+        symm_buffer = self.get_symm_buffer()
+
         prepare_megamoe_inputs(
             hidden_states,
             topk_weights,
@@ -574,6 +643,55 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         )
         return y
 
+    def _run_flashinfer_mega_moe(
+        self,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        output: torch.Tensor,
+        *,
+        activation_clamp: float | None,
+    ) -> None:
+        adapter = self._flashinfer_adapter
+        if adapter is None:
+            raise RuntimeError("FlashInfer MegaMoE adapter is not configured")
+        adapter.run_into(
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            output,
+            activation_clamp=activation_clamp,
+        )
+
+    def _stage_flashinfer_mega_moe(
+        self,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        output: torch.Tensor,
+        *,
+        activation_clamp: float | None,
+    ) -> None:
+        adapter = self._flashinfer_adapter
+        if adapter is None:
+            raise RuntimeError("FlashInfer MegaMoE adapter is not configured")
+        adapter.stage_into(
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            output,
+            activation_clamp=activation_clamp,
+        )
+
+    def _compute_staged_flashinfer_mega_moe(
+        self,
+        output: torch.Tensor,
+    ) -> None:
+        adapter = self._flashinfer_adapter
+        if adapter is None:
+            raise RuntimeError("FlashInfer MegaMoE adapter is not configured")
+        adapter.compute_staged_into(output)
+
 
 DeepseekV4MegaMoEExperts.weight_loader.supports_moe_loading = True  # type: ignore[attr-defined]
 
@@ -590,14 +708,22 @@ class DeepseekV4MoE(nn.Module):
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
         self.prefix = prefix
-        self.use_mega_moe = (
-            vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe"
+        self.use_mega_moe = is_mega_moe_backend(
+            vllm_config.kernel_config.moe_backend
         )
         if self.use_mega_moe and not vllm_config.parallel_config.enable_expert_parallel:
             raise NotImplementedError(
                 "DeepSeek V4 MegaMoE currently requires expert parallel. "
                 "Enable it with --enable-expert-parallel, or pick a different "
                 "moe backend."
+            )
+        if (
+            vllm_config.kernel_config.moe_backend == FLASHINFER_MEGA_MOE_BACKEND
+            and vllm_config.parallel_config.enable_eplb
+        ):
+            raise NotImplementedError(
+                "flashinfer_mega_moe does not yet support EPLB because its native "
+                "CUDA Graph captures layer weight pointers"
             )
 
         self.routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0)
@@ -617,7 +743,7 @@ class DeepseekV4MoE(nn.Module):
             raise NotImplementedError(
                 "DeepSeek V4 MegaMoE only supports fp4 experts; got expert_dtype="
                 f"{config.expert_dtype!r}. Drop --kernel-config moe_backend="
-                "deep_gemm_mega_moe for this checkpoint."
+                f"{vllm_config.kernel_config.moe_backend} for this checkpoint."
             )
 
         self.gate = GateLinear(
@@ -1452,8 +1578,8 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         self.config = config
         self.quant_config = quant_config
         self.parallel_config = vllm_config.parallel_config
-        self.use_mega_moe = (
-            vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe"
+        self.use_mega_moe = is_mega_moe_backend(
+            vllm_config.kernel_config.moe_backend
         )
         if self.use_mega_moe and not vllm_config.parallel_config.enable_expert_parallel:
             raise NotImplementedError(
