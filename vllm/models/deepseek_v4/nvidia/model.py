@@ -696,6 +696,21 @@ class DeepseekV4MegaMoEExperts(nn.Module):
 DeepseekV4MegaMoEExperts.weight_loader.supports_moe_loading = True  # type: ignore[attr-defined]
 
 
+def _dsv4_fused_moe_pcp_size(parallel_config) -> int | None:
+    """PCP size handed to FusedMoE on the fixed CP2 PP paths.
+
+    Without EP the experts stay replicated per PCP rank: pcp_size=1 keeps
+    FusedMoEParallelConfig from flattening TP across the CP pair. With EP the
+    real PCP size is required so that ep_size=pcp_size, ep_rank=pcp_rank and
+    MoERunner gathers / reduce-scatters tokens over the PCP group, which the
+    config layer verifies to coincide with the EP group under
+    VLLM_DSV4_CP2PP4.
+    """
+    if not (envs.VLLM_DSV4_CP2PP4 or envs.VLLM_DSV4_CP2TP2PP2):
+        return None
+    return None if parallel_config.enable_expert_parallel else 1
+
+
 class DeepseekV4MoE(nn.Module):
     def __init__(
         self,
@@ -876,7 +891,7 @@ class DeepseekV4MoE(nn.Module):
             router_logits_dtype=torch.float32,
             enable_eplb=parallel_config.enable_eplb,
             num_redundant_experts=eplb_config.num_redundant_experts,
-            pcp_size=(1 if envs.VLLM_DSV4_CP2PP4 or envs.VLLM_DSV4_CP2TP2PP2 else None),
+            pcp_size=_dsv4_fused_moe_pcp_size(parallel_config),
         )
         self.n_local_experts = self.experts.expert_map_manager.local_num_experts
         self.experts_start_idx = 0
@@ -884,6 +899,22 @@ class DeepseekV4MoE(nn.Module):
         self.n_local_physical_experts = self.n_local_experts
         self.physical_expert_start = self.experts_start_idx
         self.physical_expert_end = self.experts_end_idx
+        mpc = self.experts.moe_config.moe_parallel_config
+        logger.info_once(
+            "DeepseekV4 FusedMoE parallel config: use_ep=%s ep_size=%d ep_rank=%d "
+            "pcp_size=%d pcp_rank=%d tp_size=%d dp_size=%d "
+            "all2all_backend=%s local_num_experts=%d/%d",
+            mpc.use_ep,
+            mpc.ep_size,
+            mpc.ep_rank,
+            mpc.pcp_size,
+            mpc.pcp_rank,
+            mpc.tp_size,
+            mpc.dp_size,
+            mpc.all2all_backend,
+            self.n_local_experts,
+            config.n_routed_experts,
+        )
 
     def forward(
         self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None = None
@@ -930,6 +961,10 @@ class DeepseekV4MoE(nn.Module):
         self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None = None
     ) -> torch.Tensor:
         org_shape = hidden_states.shape
+        # Only hash-routed layers consume input_ids. Passing None elsewhere
+        # spares MoERunner a per-layer PCP all-gather of the ids under EP.
+        if self.gate.tid2eid is None:
+            input_ids = None
         if self.experts.is_internal_router:
             # In this case, the gate/router runs inside the FusedMoE class
             final_hidden_states = self.experts(

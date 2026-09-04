@@ -775,7 +775,8 @@ class MoERunner(MoERunnerInterface):
         self,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        input_ids: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         # For naive dispatch/combine Dp/Ep, dispatch the hidden states and
         # router logits to all experts.
         # NOTE: this will be removed once all kernels are migrated into the
@@ -792,6 +793,9 @@ class MoERunner(MoERunnerInterface):
         # NOTE: Similar with DP, PCP also needs dispatch and combine. For
         # simplicity, AgRsAll2All was added separately for PCP here. Maybe
         # we should modify All2AllManager abstraction to better support PCP.
+        # The all-gather assumes every PCP rank holds the same number of
+        # tokens (true for the fixed-shape DSV4 CP2 paths, which split each
+        # 2048/4096-token chunk evenly and reject any other chunk size).
         if self.moe_config.pcp_size > 1:
             hidden_states = get_pcp_group().all_gather(
                 hidden_states,
@@ -801,8 +805,16 @@ class MoERunner(MoERunnerInterface):
                 router_logits,
                 dim=0,
             )
+            if input_ids is not None:
+                # Hash-routed layers (DeepSeek V4) index the routing table
+                # with the token id of every gathered row, so the ids must
+                # travel with the hidden states.
+                input_ids = get_pcp_group().all_gather(
+                    input_ids.contiguous(),
+                    dim=0,
+                )
 
-        return hidden_states, router_logits
+        return hidden_states, router_logits, input_ids
 
     def _maybe_combine(
         self,
@@ -865,9 +877,10 @@ class MoERunner(MoERunnerInterface):
             # TODO(bnell): parts of the dispatch/combine steps will go away once
             # #32567 lands and the remaining kernels are made MKs.  The PCP
             # code will probably remain
-            hidden_states, router_logits = self._maybe_dispatch(
+            hidden_states, router_logits, input_ids = self._maybe_dispatch(
                 hidden_states,
                 router_logits,
+                input_ids,
             )
 
             shared_output, hidden_states = self._apply_quant_method(

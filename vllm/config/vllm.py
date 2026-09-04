@@ -1041,11 +1041,9 @@ class VllmConfig:
         if cp2tp2pp2 and parallel.enable_expert_parallel:
             raise ValueError(f"{mode} requires expert parallelism disabled")
         if cp2pp4 and parallel.enable_expert_parallel:
-            if self.kernel_config.moe_backend != "flashinfer_mega_moe":
-                raise ValueError(
-                    f"{mode} only supports expert parallelism with "
-                    "--moe-backend flashinfer_mega_moe"
-                )
+            # Both the MegaMoE path and the FusedMoE path (experts sharded
+            # ep_size=pcp_size, tokens all-gathered / reduce-scattered over the
+            # PCP group by MoERunner) rely on EP groups == PCP pairs.
             self._verify_dsv4_cp2ep2pp4_groups(mode)
         if self.cache_config.enable_prefix_caching:
             raise ValueError(f"{mode} requires prefix caching disabled")
