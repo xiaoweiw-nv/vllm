@@ -1,10 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Packed-cache replication for the fixed DeepSeek-V4 CP2PP4 prototype."""
+"""Packed-cache replication and C4 halo exchange for the fixed-shape
+DeepSeek-V4 CP x PP prototype (PCP world size 2 or 4, zigzag segments)."""
 
 import torch
 
 from vllm.distributed import get_pcp_group
+from vllm.v1.worker.cp2pp4 import (
+    CP2PP4_HALO_ROWS,
+    CP2PP4_SUPPORTED_WORLD_SIZES,
+    cp2pp4_halo_sources,
+    get_cp2pp4_supported_local_tokens,
+)
 
 
 def get_effective_cache_shard_count(
@@ -87,10 +94,13 @@ def replicate_split_cache_rows_(
     scale_bytes: int,
     expected_local_rows: int,
 ) -> None:
-    """All-gather newly written packed rows and install them in both PCP replicas."""
+    """All-gather newly written packed rows and install them in every PCP replica."""
     group = get_pcp_group()
-    if group.world_size != 2:
-        raise RuntimeError(f"CP2PP4 requires a PCP2 group, got {group.world_size}")
+    if group.world_size not in CP2PP4_SUPPORTED_WORLD_SIZES:
+        raise RuntimeError(
+            "CP2PP4 requires a PCP group of size "
+            f"{CP2PP4_SUPPORTED_WORLD_SIZES}, got {group.world_size}"
+        )
 
     local_slots = (
         slot_mapping[slot_mapping >= 0].to(dtype=torch.int64).contiguous()
@@ -126,30 +136,41 @@ def replicate_split_cache_rows_(
 def exchange_cp2pp4_boundary_halo(
     hidden_states: torch.Tensor,
     positions: torch.Tensor,
+    max_num_batched_tokens: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Exchange the four rows preceding each cross-owner C4 segment boundary."""
+    """Exchange the rows preceding each cross-owner C4 segment boundary.
+
+    Every rank owns two zigzag segments (``vllm.v1.worker.cp2pp4``) and
+    publishes the last ``CP2PP4_HALO_ROWS`` rows of each; one all-gather of
+    ``2 * HALO`` rows per rank, then each rank selects the tails it needs
+    (one for ranks 0 and W-1, two for the inner ranks). Returns the halo rows
+    and their positions in ascending position order.
+    """
     local_rows = hidden_states.shape[0]
-    if local_rows not in (1024, 2048) or positions.shape[0] != local_rows:
+    group = get_pcp_group()
+    world_size = group.world_size
+    rank = group.rank_in_group
+    supported = get_cp2pp4_supported_local_tokens(max_num_batched_tokens, world_size)
+    if local_rows not in supported or positions.shape[0] != local_rows:
         raise RuntimeError(
-            "CP2PP4 boundary exchange requires 1024 or 2048 matching local rows, "
+            f"CP2PP4 boundary exchange requires {supported} matching local rows, "
             f"got hidden={local_rows}, positions={positions.shape[0]}"
         )
-    group = get_pcp_group()
-    rank = group.rank_in_group
-    if group.world_size != 2 or rank not in (0, 1):
-        raise RuntimeError(
-            f"CP2PP4 requires a PCP2 group, got size={group.world_size}, rank={rank}"
-        )
-
-    if rank == 0:
-        boundary = local_rows // 2
-        local_hidden = hidden_states[boundary - 4 : boundary].contiguous()
-        local_positions = positions[boundary - 4 : boundary].contiguous()
-    else:
-        local_hidden = hidden_states[-4:].contiguous()
-        local_positions = positions[-4:].contiguous()
+    segment = local_rows // 2
+    halo = CP2PP4_HALO_ROWS
+    tails = (slice(segment - halo, segment), slice(local_rows - halo, local_rows))
+    local_hidden = torch.cat([hidden_states[t] for t in tails], dim=0).contiguous()
+    local_positions = torch.cat([positions[t] for t in tails], dim=0).contiguous()
 
     gathered_hidden = group.all_gather(local_hidden, dim=0)
     gathered_positions = group.all_gather(local_positions, dim=0)
-    remote = slice(4, 8) if rank == 0 else slice(0, 4)
-    return gathered_hidden[remote], gathered_positions[remote]
+    picks = [
+        slice((2 * src + tail) * halo, (2 * src + tail + 1) * halo)
+        for src, tail in cp2pp4_halo_sources(rank, world_size)
+    ]
+    if len(picks) == 1:
+        return gathered_hidden[picks[0]], gathered_positions[picks[0]]
+    return (
+        torch.cat([gathered_hidden[p] for p in picks], dim=0),
+        torch.cat([gathered_positions[p] for p in picks], dim=0),
+    )

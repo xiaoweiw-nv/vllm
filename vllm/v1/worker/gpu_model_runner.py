@@ -1997,6 +1997,7 @@ class GPUModelRunner(
                 chunk_start,
                 total_num_scheduled_tokens,
                 get_pcp_group().rank_in_group,
+                get_pcp_group().world_size,
             )
             local_tokens = cp2pp4_shard.local_indices.size
             global_num_scheduled_tokens = num_scheduled_tokens.copy()

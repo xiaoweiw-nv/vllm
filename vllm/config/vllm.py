@@ -997,20 +997,25 @@ class VllmConfig:
 
         parallel = self.parallel_config
         scheduler = self.scheduler_config
+        pcp = parallel.prefill_context_parallel_size
         if cp2tp2pp2:
             mode = "VLLM_DSV4_CP2TP2PP2"
             expected_tp = 2
             expected_pp = 2
+            expected_pcp = 2
         else:
+            # VLLM_DSV4_CP2PP4 covers the eight-GPU CP x PP layouts with one
+            # CP group per PP stage: CP2·PP4 (historical) and CP4·PP2.
             mode = "VLLM_DSV4_CP2PP4"
             expected_tp = 1
-            expected_pp = 4
+            expected_pcp = pcp if pcp in (2, 4) else 2
+            expected_pp = 8 // expected_pcp
         checks = {
             "tensor_parallel_size": (parallel.tensor_parallel_size, expected_tp),
             "pipeline_parallel_size": (parallel.pipeline_parallel_size, expected_pp),
             "prefill_context_parallel_size": (
                 parallel.prefill_context_parallel_size,
-                2,
+                expected_pcp,
             ),
             "decode_context_parallel_size": (
                 parallel.decode_context_parallel_size,
@@ -1088,7 +1093,8 @@ class VllmConfig:
                 )
 
     def _verify_dsv4_cp2ep2pp4_groups(self, mode: str) -> None:
-        """Require CP2EP2PP4 to overlay EP groups exactly on PCP groups."""
+        """Require the EP groups to overlay exactly on the PCP groups
+        (CP2·EP2·PP4 or CP4·EP4·PP2)."""
         parallel = self.parallel_config
         world_size = (
             parallel.data_parallel_size
@@ -1114,10 +1120,13 @@ class VllmConfig:
             * parallel.tensor_parallel_size
         )
         ep_groups = all_ranks.transpose(1, 2).reshape(-1, ep_world_size).tolist()
-        if ep_world_size != 2 or ep_groups != pcp_groups:
+        if (
+            ep_world_size != parallel.prefill_context_parallel_size
+            or ep_groups != pcp_groups
+        ):
             raise ValueError(
                 f"{mode} with expert parallelism requires EP groups to "
-                "coincide with PCP pairs; got "
+                "coincide with PCP groups; got "
                 f"data_parallel_size={parallel.data_parallel_size}, "
                 f"tensor_parallel_size={parallel.tensor_parallel_size}, "
                 f"pipeline_parallel_size={parallel.pipeline_parallel_size}, "

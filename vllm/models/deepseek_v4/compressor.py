@@ -506,8 +506,12 @@ class DeepseekCompressor(nn.Module):
             pdl_kwargs={"launch_pdl": False},
         )
 
-    def replicate_cp2pp4_kv_cache(self) -> None:
-        """Replicate this chunk's newly compressed packed rows across PCP2."""
+    def replicate_cp2pp4_kv_cache(self, local_rows: int) -> None:
+        """Replicate this chunk's newly compressed packed rows across the PCP group.
+
+        ``local_rows`` is this rank's share of the current global chunk; the
+        compressor wrote ``local_rows // compress_ratio`` packed rows.
+        """
         attn_metadata = get_forward_context().attn_metadata
         if not isinstance(attn_metadata, dict):
             return
@@ -531,7 +535,5 @@ class DeepseekCompressor(nn.Module):
             k_cache_layer.kv_cache.shape[1],
             data_bytes,
             scale_bytes,
-            expected_local_rows=(
-                self.max_num_batched_tokens // 2 // self.compress_ratio
-            ),
+            expected_local_rows=local_rows // self.compress_ratio,
         )

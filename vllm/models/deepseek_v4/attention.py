@@ -27,7 +27,10 @@ from vllm.models.deepseek_v4.common.ops import (
     fused_indexer_q_rope_quant,
     fused_q_kv_rmsnorm,
 )
-from vllm.v1.worker.cp2pp4 import dsv4_cp2pp_fixed_shape_enabled
+from vllm.v1.worker.cp2pp4 import (
+    dsv4_cp2pp_fixed_shape_enabled,
+    get_cp2pp4_supported_local_tokens,
+)
 
 if TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.sparse_swa import (
@@ -664,11 +667,15 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
     ) -> None:
         forward_context = get_forward_context()
         attn_metadata = forward_context.attn_metadata
-        expected_local_rows = self.max_num_batched_tokens // 2
+        # Rank-local rows of one fixed-shape prefill chunk (global chunk /
+        # PCP world size; a prompt tail may arrive as a smaller supported
+        # chunk). Decode steps (1 row) never match.
+        expected_local_rows = positions.shape[0]
         is_cp2pp4_prefill = (
             dsv4_cp2pp_fixed_shape_enabled()
             and isinstance(attn_metadata, dict)
-            and positions.shape[0] == expected_local_rows
+            and expected_local_rows
+            in get_cp2pp4_supported_local_tokens(self.max_num_batched_tokens)
         )
 
         if (
@@ -677,7 +684,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             and (self.compressor is not None or self.indexer is not None)
         ):
             halo_hidden, halo_positions = exchange_cp2pp4_boundary_halo(
-                hidden_states, positions
+                hidden_states, positions, self.max_num_batched_tokens
             )
             if self.compressor is not None:
                 self.compressor.write_cp2pp4_halo(halo_hidden, halo_positions)
@@ -766,7 +773,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 expected_local_rows=expected_local_rows,
             )
             if self.compressor is not None:
-                self.compressor.replicate_cp2pp4_kv_cache()
+                self.compressor.replicate_cp2pp4_kv_cache(expected_local_rows)
 
         # MLA attention writes into the pre-allocated `out` buffer
         # ([num_tokens, padded_heads, head_dim]).
@@ -1189,12 +1196,12 @@ class DeepseekV4Indexer(nn.Module):
                 events[1],
                 self.aux_stream,
             )
-        expected_local_rows = (
-            self.vllm_config.scheduler_config.max_num_batched_tokens // 2
-        )
-        if (
-            dsv4_cp2pp_fixed_shape_enabled()
-            and positions.shape[0] == expected_local_rows
+        local_rows = positions.shape[0]
+        if dsv4_cp2pp_fixed_shape_enabled() and (
+            local_rows
+            in get_cp2pp4_supported_local_tokens(
+                self.vllm_config.scheduler_config.max_num_batched_tokens
+            )
         ):
-            compressor.replicate_cp2pp4_kv_cache()
+            compressor.replicate_cp2pp4_kv_cache(local_rows)
         return self.indexer_op(hidden_states, q_quant, k, weights)
