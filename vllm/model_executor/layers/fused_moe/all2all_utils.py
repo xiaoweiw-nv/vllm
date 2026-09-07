@@ -114,6 +114,51 @@ def maybe_roundup_layer_hidden_size(
     return hidden_size
 
 
+def _maybe_make_pcp_pcie_dma_prepare_finalize(
+    moe: FusedMoEConfig,
+    quant_config: FusedMoEQuantConfig | None,
+    use_monolithic: bool,
+) -> FusedMoEPrepareAndFinalize | None:
+    from vllm.distributed.device_communicators.pcp_pcie_dma import (
+        PcpPcieDmaLayout,
+        get_pcp_pcie_dma_transport,
+    )
+    from vllm.model_executor.layers.fused_moe.prepare_finalize.pcp_pcie_dma import (  # noqa: E501
+        PcpPcieDmaPrepareAndFinalize,
+    )
+
+    if use_monolithic:
+        raise NotImplementedError(
+            "--all2all-backend pcie_dma requires a modular MoE kernel"
+        )
+    if quant_config is None or quant_config.quant_dtype != current_platform.fp8_dtype():
+        raise NotImplementedError(
+            "--all2all-backend pcie_dma requires fp8 block-quantized activations "
+            f"(got quant_dtype={None if quant_config is None else quant_config.quant_dtype!r})"
+        )
+    block_shape = quant_config.block_shape
+    if block_shape is None or quant_config.per_act_token_quant:
+        raise NotImplementedError(
+            "--all2all-backend pcie_dma requires per-token-group fp8 activation scales"
+        )
+    # Capacity: the gathered rows of one call are pcp_size x the local rows;
+    # no rank ever holds more than max_num_batched_tokens rows.
+    max_local = get_current_vllm_config().scheduler_config.max_num_batched_tokens
+    layout = PcpPcieDmaLayout(
+        hidden_dim=moe.hidden_dim,
+        sf_k=moe.hidden_dim // block_shape[1],
+        topk=moe.experts_per_token,
+        max_gathered_rows=max_local * moe.moe_parallel_config.pcp_size,
+        ids_dtype=torch.int32,
+        weights_dtype=torch.float32,
+        out_dtype=moe.in_dtype,
+    )
+    transport = get_pcp_pcie_dma_transport(layout)
+    if transport is None:
+        return None
+    return PcpPcieDmaPrepareAndFinalize(transport)
+
+
 def maybe_make_prepare_finalize(
     moe: FusedMoEConfig,
     quant_config: FusedMoEQuantConfig | None,
@@ -136,6 +181,15 @@ def maybe_make_prepare_finalize(
     #   * maybe_make_prepare_finalize() is called from the oracle. We
     #     always return a PrepareAndFinalize object and the quant method
     #     holds the ModularKernel.
+    if moe.moe_parallel_config.use_pcie_dma_kernels:
+        prepare_finalize = _maybe_make_pcp_pcie_dma_prepare_finalize(
+            moe, quant_config, use_monolithic
+        )
+        if prepare_finalize is not None:
+            return prepare_finalize
+        # Transport unavailable on this pair: fall through to the regular
+        # path (MoERunner keeps its NCCL PCP all-gather / reduce-scatter).
+
     if not moe.moe_parallel_config.use_all2all_kernels:
         if not allow_new_interface:
             return None

@@ -143,7 +143,11 @@ class CudaCommunicator(DeviceCommunicatorBase):
             self._log_all_reduce_backend_selection()
 
         if self.use_all2all:
-            if self.all2all_backend in ("naive", "allgather_reducescatter"):
+            if self.all2all_backend in (
+                "naive",
+                "allgather_reducescatter",
+                "pcie_dma",
+            ):
                 from .all2all import AgRsAll2AllManager
 
                 self.all2all_manager = AgRsAll2AllManager(

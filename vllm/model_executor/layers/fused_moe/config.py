@@ -1101,6 +1101,15 @@ class FusedMoEParallelConfig:
         )
 
     @property
+    def use_pcie_dma_kernels(self):
+        """EP across a prefill-context-parallel pair with the copy-engine
+        PCIe transport (dispatch/combine handled inside the modular kernel
+        instead of MoERunner's NCCL all-gather / reduce-scatter)."""
+        return (
+            self.use_ep and self.pcp_size == 2 and self.all2all_backend == "pcie_dma"
+        )
+
+    @property
     def use_mori_kernels(self):
         return self.use_all2all_kernels and self.all2all_backend in (
             "mori_high_throughput",
@@ -1428,6 +1437,10 @@ class FusedMoEConfig:
     @property
     def use_deepep_ll_kernels(self):
         return self.moe_parallel_config.use_deepep_ll_kernels
+
+    @property
+    def use_pcie_dma_kernels(self):
+        return self.moe_parallel_config.use_pcie_dma_kernels
 
     @property
     def use_mori_kernels(self):

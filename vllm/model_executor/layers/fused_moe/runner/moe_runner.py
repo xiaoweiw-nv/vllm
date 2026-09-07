@@ -771,6 +771,17 @@ class MoERunner(MoERunnerInterface):
             self.moe_config.dp_size > 1 or self.moe_config.is_sequence_parallel
         ) and not self._quant_method.supports_internal_mk
 
+    @property
+    def pcp_exchange_in_mk(self) -> bool:
+        """True when the modular kernel's PrepareAndFinalize performs the PCP
+        pair all-gather / reduce-scatter itself (``pcie_dma`` backend), so the
+        runner must not gather hidden states / logits or reduce-scatter the
+        output and the router runs on the local rows only."""
+        moe_kernel = self._quant_method.moe_kernel
+        return moe_kernel is not None and getattr(
+            moe_kernel.prepare_finalize, "handles_pcp_exchange", False
+        )
+
     def _maybe_dispatch(
         self,
         hidden_states: torch.Tensor,
@@ -796,7 +807,7 @@ class MoERunner(MoERunnerInterface):
         # The all-gather assumes every PCP rank holds the same number of
         # tokens (true for the fixed-shape DSV4 CP2 paths, which split each
         # 2048/4096-token chunk evenly and reject any other chunk size).
-        if self.moe_config.pcp_size > 1:
+        if self.moe_config.pcp_size > 1 and not self.pcp_exchange_in_mk:
             hidden_states = get_pcp_group().all_gather(
                 hidden_states,
                 dim=0,
@@ -826,7 +837,7 @@ class MoERunner(MoERunnerInterface):
                 hidden_states, self.moe_config.is_sequence_parallel
             )
 
-        if self.moe_config.pcp_size > 1:
+        if self.moe_config.pcp_size > 1 and not self.pcp_exchange_in_mk:
             hidden_states = get_pcp_group().reduce_scatter(
                 hidden_states,
                 dim=0,
