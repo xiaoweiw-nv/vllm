@@ -1,14 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Copy-engine (CE) PCIe transport for the MoE exchange across a CP2 pair.
+"""Copy-engine (CE) PCIe transport for the MoE exchange across a CP group.
 
 Under ``VLLM_DSV4_CP2PP4`` with ``--enable-expert-parallel`` the EP group is
-exactly the prefill-context-parallel pair, so every MoE layer does an
-all-gather of the routed inputs (dispatch) and a reduce-scatter of the expert
-partial sums (combine) between two GPUs that sit on the same PCIe switch.
-NCCL's SM-driven transport reaches ~30 GB/s on that link; plain copy-engine
-``cudaMemcpyAsync`` into a CUDA-IPC mapped peer buffer reaches ~52 GB/s in
-both directions concurrently and leaves the SMs free for the shared experts.
+exactly the prefill-context-parallel group (a PXB pair at CP2, two PXB pairs
+under one host bridge at CP4), so every MoE layer does an all-gather of the
+routed inputs (dispatch) and a reduce-scatter of the expert partial sums
+(combine) inside that group.  NCCL's SM-driven transport reaches ~30 GB/s on
+these links; plain copy-engine copies into CUDA-IPC mapped peer buffers reach
+~52 GB/s per link in both directions concurrently and leave the SMs free for
+the shared experts.
+
+Both collectives are unidirectional rings over the PCP ranks (rank r sends to
+r+1): W-1 steps, every hop on a distinct link, one copy engine per hop.  At
+world 4 the two PCIe switches share one uplink each, so a direct all-to-all
+puts 4 blocks per direction on it against the ring's 3 (measured 459-532 us
+vs 283 us for the all-gather, artifacts/cp4ep4pp2/RESULTS.md).  World 2 is
+the same code with a single step.
 
 This module owns the per-rank IPC slab (flags + all-gather regions + the
 reduce-scatter landing zone), a dedicated comm stream, and the b12x CuTe flag
@@ -16,27 +24,35 @@ reduce-scatter landing zone), a dedicated comm stream, and the b12x CuTe flag
 no host synchronisation is needed per call, so the collectives are also CUDA
 graph capturable.
 
-Wire protocol per MoE call (rank r, peer p, M local rows, both ranks agree
-on M):
+Wire protocol per MoE call (rank r, next rank n = r+1, W ranks, M local rows,
+all ranks agree on M; block b = rows [b*M, (b+1)*M) of the gathered tensors):
 
-  all-gather
+  all-gather (ring, W-1 steps, all on the comm stream)
     main : quantize my M rows straight into block r of my a1q slab, stage the
            fp32 group scales / topk ids / topk weights next to them
-    comm : CE-copy my four blocks into block r of the PEER's slab, then
-           publish flag AG on the peer
-    main : wait flag AG (peer's blocks landed in MY slab) -> the gathered
-           [2M, ...] tensors are contiguous views of my slab
-  reduce-scatter
-    comm : CE-copy rows of block p of my bf16 partial sums into the peer's
-           RS landing zone, publish flag RS
-    main : wait flag RS, out = partial[block r] + rs_landing (first-touch add)
+    comm : step k: (k > 0: wait flag AG_{k-1} = block r-k landed from r-1)
+           CE-copy block r-k of my four regions into block r-k of rank n's
+           slab, publish flag AG_k on n
+    main : wait flag AG_{W-2} + the comm stream -> the gathered [W*M, ...]
+           tensors are contiguous views of my slab
+  reduce-scatter (ring, W-1 steps, all on the comm stream so the shared
+  experts on the main stream overlap the whole exchange)
+    comm : step 0: CE-copy block r-1 of my bf16 partials into scratch 0 of n,
+           publish RS_0
+           step k > 0: wait RS_{k-1} (scratch k-1 holds the running sum of
+           block r-k-1 from the W ranks upstream), partial[r-k-1] += scratch
+           k-1 in place, CE-copy that block into scratch k of n, publish RS_k
+           last: wait RS_{W-2}, out = partial[r] + scratch W-2 (first touch)
+    main : wait the comm stream
 
-Both flags are monotonic counters (b12x ``dma_set_flag`` / ``dma_wait_flag``)
+All flags are monotonic counters (b12x ``dma_set_flag`` / ``dma_wait_flag``)
 so a slot never needs resetting and the sequence of calls is the only
 synchronisation.  The slab is single-buffered: the dependency chain of one
-layer (my RS copy is issued only after my GEMMs finished reading my gathered
-slab; the peer's next-layer AG copy is issued only after it consumed my RS
-flag) guarantees the peer never overwrites data that is still being read.
+layer (my RS copies are issued only after my GEMMs finished reading my
+gathered slab; the upstream rank's next-layer AG copy into my slab is issued
+only after it consumed my RS flags of this layer, and the ring order makes
+every rank's step k wait for its upstream step k-1) guarantees nobody
+overwrites data that is still being read.
 """
 
 from __future__ import annotations
@@ -55,9 +71,11 @@ logger = init_logger(__name__)
 # b12x FLAG_STRIDE: one 128 B line per flag so the peer's system-scope store
 # never shares a line with another slot.
 _FLAG_STRIDE = 128
-_FLAG_SLOTS = 8
-_SLOT_AG = 0
-_SLOT_RS = 1
+_FLAG_SLOTS = 32
+_MAX_WORLD = 8
+_SLOT_AG = 0  # + step
+_SLOT_RS = _MAX_WORLD  # + step
+_SLOT_BARRIER = _FLAG_SLOTS - 1
 _REGION_ALIGN = 4096
 _BF16_DTYPE_CODE = 0  # b12x SUPPORTED_DTYPES[torch.bfloat16]
 
@@ -93,7 +111,7 @@ def _raw_view(
 
 @dataclass(frozen=True)
 class PcpPcieDmaLayout:
-    """Byte layout of one rank's slab (identical on both ranks)."""
+    """Byte layout of one rank's slab (identical on every rank)."""
 
     hidden_dim: int
     sf_k: int
@@ -102,6 +120,11 @@ class PcpPcieDmaLayout:
     ids_dtype: torch.dtype
     weights_dtype: torch.dtype
     out_dtype: torch.dtype
+    world_size: int = 2
+
+    @property
+    def max_local_rows(self) -> int:
+        return self.max_gathered_rows // self.world_size
 
     @property
     def a1q_row_bytes(self) -> int:
@@ -132,9 +155,10 @@ class PcpPcieDmaLayout:
             ("scale", cap * self.scale_row_bytes),
             ("ids", cap * self.ids_row_bytes),
             ("weights", cap * self.weights_row_bytes),
-            # The RS landing zone holds the peer's partials for MY rows only
-            # (half of the gathered rows).
-            ("rs", (cap // 2) * self.out_row_bytes),
+            # Ring reduce-scatter scratch: one landing block of local rows
+            # per ring step (W-1 blocks; the upstream rank writes step k into
+            # block k).
+            ("rs", (self.world_size - 1) * self.max_local_rows * self.out_row_bytes),
         ]
         out: dict[str, tuple[int, int]] = {}
         off = 0
@@ -146,10 +170,11 @@ class PcpPcieDmaLayout:
 
 
 class PcpPcieDmaTransport:
-    """CE all-gather / reduce-scatter between the two ranks of a PCP pair.
+    """CE ring all-gather / reduce-scatter over the ranks of a PCP group.
 
     Construction is collective over ``exchange_group`` (a CPU/gloo process
-    group of exactly the two ranks) and must be called by both ranks.
+    group of exactly the PCP ranks, in PCP rank order) and must be called by
+    every rank.
     """
 
     def __init__(
@@ -162,11 +187,20 @@ class PcpPcieDmaTransport:
         self.group = exchange_group
         self.rank = dist.get_rank(group=exchange_group)
         self.world_size = dist.get_world_size(group=exchange_group)
-        if self.world_size != 2:
+        if not 2 <= self.world_size <= _MAX_WORLD:
             raise ValueError(
-                f"PcpPcieDmaTransport supports exactly 2 ranks, got {self.world_size}"
+                "PcpPcieDmaTransport supports 2 to "
+                f"{_MAX_WORLD} ranks, got {self.world_size}"
             )
-        self.peer = 1 - self.rank
+        if layout.world_size != self.world_size:
+            raise ValueError(
+                f"layout.world_size={layout.world_size} does not match the "
+                f"exchange group size {self.world_size}"
+            )
+        # Ring neighbours: I write into `nxt`'s slab, `prv` writes into mine.
+        self.nxt = (self.rank + 1) % self.world_size
+        self.prv = (self.rank - 1) % self.world_size
+        self.peer = self.nxt  # kept for callers of the pair-era API
         self.device = device
         self.layout = layout
         self._offsets = layout.offsets()
@@ -189,8 +223,9 @@ class PcpPcieDmaTransport:
             handle = self._ipc.cudaIpcGetMemHandleBytes(self._local_ptr)
             handles: list[bytes | None] = [None] * self.world_size
             dist.all_gather_object(handles, handle, group=exchange_group)
-            peer_handle = handles[self.peer]
+            peer_handle = handles[self.nxt]
             assert peer_handle is not None
+            # Only the downstream neighbour's slab is ever written by me.
             self._peer_ptr = self._ipc.cudaIpcOpenMemHandleBytes(peer_handle)
 
             # Compile + warm the flag and add kernels before first use.
@@ -207,7 +242,7 @@ class PcpPcieDmaTransport:
             self._ev_ag_input_ready = torch.cuda.Event()
             self._ev_ag_copied = torch.cuda.Event()
             self._ev_rs_input_ready = torch.cuda.Event()
-            self._ev_rs_copied = torch.cuda.Event()
+            self._ev_rs_done = torch.cuda.Event()
 
             # Make sure the peer mapping works before anyone relies on it:
             # exchange one flag round trip.
@@ -215,15 +250,17 @@ class PcpPcieDmaTransport:
 
         self.num_calls = 0
         logger.info(
-            "PcpPcieDmaTransport ready: rank %d/%d device %s slab %.1f MiB "
-            "(a1q %d rows x %d, rs %d rows x %d B)",
+            "PcpPcieDmaTransport ready: rank %d/%d (ring -> %d) device %s slab "
+            "%.1f MiB (a1q %d rows x %d, rs %d x %d rows x %d B)",
             self.rank,
             self.world_size,
+            self.nxt,
             self.device,
             total / 2**20,
             layout.max_gathered_rows,
             layout.hidden_dim,
-            layout.max_gathered_rows // 2,
+            self.world_size - 1,
+            layout.max_local_rows,
             layout.out_row_bytes,
         )
 
@@ -262,10 +299,25 @@ class PcpPcieDmaTransport:
         )
 
     def _barrier_flag_roundtrip(self) -> None:
-        slot = _FLAG_SLOTS - 1
-        self._publish(slot)
-        self._wait(slot)
+        # Every rank publishes on its downstream neighbour and waits for its
+        # upstream one: a full ring handshake.
+        self._publish(_SLOT_BARRIER)
+        self._wait(_SLOT_BARRIER)
         torch.cuda.current_stream(self.device).synchronize()
+
+    def _rs_scratch(self, base: int, step: int, m_local: int) -> int:
+        return self._region(base, "rs") + step * m_local * self.layout.out_row_bytes
+
+    _AG_REGIONS = ("a1q", "scale", "ids", "weights")
+
+    def _ag_row_bytes(self, name: str) -> int:
+        lay = self.layout
+        return {
+            "a1q": lay.a1q_row_bytes,
+            "scale": lay.scale_row_bytes,
+            "ids": lay.ids_row_bytes,
+            "weights": lay.weights_row_bytes,
+        }[name]
 
     # --------------------------------------------------------------- AG views
     def ag_local_views(
@@ -309,7 +361,7 @@ class PcpPcieDmaTransport:
     def ag_gathered_views(
         self, m_local: int
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Views of the gathered [2M, ...] tensors (rank-major row blocks)."""
+        """Views of the gathered [W*M, ...] tensors (rank-major row blocks)."""
         self._check_rows(m_local)
         lay = self.layout
         m = m_local * self.world_size
@@ -344,11 +396,12 @@ class PcpPcieDmaTransport:
         )
         return a1q, scale, ids, weights
 
-    def rs_landing_view(self, m_local: int) -> torch.Tensor:
+    def rs_landing_view(self, m_local: int, step: int = 0) -> torch.Tensor:
+        """View of ring-step `step`'s landing block in my RS scratch."""
         self._check_rows(m_local)
         lay = self.layout
         return _raw_view(
-            self._region(self._local_ptr, "rs"),
+            self._rs_scratch(self._local_ptr, step, m_local),
             m_local * lay.out_row_bytes,
             self.device,
             lay.out_dtype,
@@ -357,79 +410,100 @@ class PcpPcieDmaTransport:
 
     # ------------------------------------------------------------ collectives
     def ag_publish(self, m_local: int) -> None:
-        """Ship my four AG blocks to the peer (call after filling the local
-        views on the current stream)."""
+        """Run the ring all-gather on the comm stream (call after filling the
+        local views on the current stream)."""
         self._check_rows(m_local)
-        lay = self.layout
-        r = self.rank
+        r, w = self.rank, self.world_size
         main = torch.cuda.current_stream(self.device)
         self._ev_ag_input_ready.record(main)
         comm = self.comm_stream
         comm.wait_event(self._ev_ag_input_ready)
         with torch.cuda.stream(comm):
-            for name, row_bytes in (
-                ("a1q", lay.a1q_row_bytes),
-                ("scale", lay.scale_row_bytes),
-                ("ids", lay.ids_row_bytes),
-                ("weights", lay.weights_row_bytes),
-            ):
-                off = r * m_local * row_bytes
-                self._kernels.dma_copy(
-                    self._region(self._peer_ptr, name) + off,
-                    self._region(self._local_ptr, name) + off,
-                    m_local * row_bytes,
-                )
-            self._publish(_SLOT_AG)
+            for k in range(w - 1):
+                blk = (r - k) % w
+                if k > 0:
+                    # Forward only what landed: block r-k came from prv in
+                    # step k-1.
+                    self._wait(_SLOT_AG + k - 1)
+                for name in self._AG_REGIONS:
+                    off = blk * m_local * self._ag_row_bytes(name)
+                    self._kernels.dma_copy(
+                        self._region(self._peer_ptr, name) + off,
+                        self._region(self._local_ptr, name) + off,
+                        m_local * self._ag_row_bytes(name),
+                    )
+                self._publish(_SLOT_AG + k)
             self._ev_ag_copied.record(comm)
 
     def ag_wait(self) -> None:
-        """Block the current stream until the peer's blocks landed in my slab
-        and my own outgoing copies finished reading my blocks."""
+        """Block the current stream until every block landed in my slab and
+        my own outgoing copies finished reading it."""
         main = torch.cuda.current_stream(self.device)
-        self._wait(_SLOT_AG)
+        # Steps < W-2 were waited on the comm stream (before forwarding);
+        # the last step's flag is waited here.  The comm-stream event orders
+        # those earlier waits before anything the main stream does next.
+        self._wait(_SLOT_AG + self.world_size - 2)
         main.wait_event(self._ev_ag_copied)
 
-    def rs_publish(self, partial: torch.Tensor) -> None:
-        """Ship block `peer` of `partial` ([2M, H] bf16, contiguous) to the
-        peer's landing zone."""
+    def rs_publish(self, partial: torch.Tensor, out: torch.Tensor) -> None:
+        """Run the ring reduce-scatter of `partial` ([W*M, H] bf16,
+        contiguous) on the comm stream; `out` ([M, H]) receives the fully
+        reduced block `rank`.  Blocks other than `rank` of `partial` are used
+        as in-place accumulators.  Returns immediately; the current stream is
+        free to run other work (the shared experts) until `rs_wait_add`."""
         assert partial.is_contiguous() and partial.dtype == self.layout.out_dtype
+        assert out.is_contiguous() and out.dtype == self.layout.out_dtype
         m_gathered, h = partial.shape
         assert h == self.layout.hidden_dim
-        m_local = m_gathered // self.world_size
+        r, w = self.rank, self.world_size
+        m_local = m_gathered // w
+        assert out.shape == (m_local, h)
         self._check_rows(m_local)
         nbytes = m_local * self.layout.out_row_bytes
+        numel = m_local * h
+        base = partial.data_ptr()
         main = torch.cuda.current_stream(self.device)
         self._ev_rs_input_ready.record(main)
         comm = self.comm_stream
         comm.wait_event(self._ev_rs_input_ready)
         with torch.cuda.stream(comm):
-            self._kernels.dma_copy(
-                self._region(self._peer_ptr, "rs"),
-                partial.data_ptr() + self.peer * nbytes,
-                nbytes,
+            for k in range(w - 1):
+                send = (r - k - 1) % w
+                if k > 0:
+                    # scratch k-1 = running sum of block `send` from the k
+                    # ranks upstream; fold it in before forwarding.
+                    self._wait(_SLOT_RS + k - 1)
+                    self._kernels.dma_add(
+                        base + send * nbytes,
+                        base + send * nbytes,
+                        self._rs_scratch(self._local_ptr, k - 1, m_local),
+                        numel,
+                        _BF16_DTYPE_CODE,
+                    )
+                self._kernels.dma_copy(
+                    self._rs_scratch(self._peer_ptr, k, m_local),
+                    base + send * nbytes,
+                    nbytes,
+                )
+                self._publish(_SLOT_RS + k)
+            # Last step: block r arrives fully reduced over the other W-1
+            # ranks; first-touch add with my own partial straight into out.
+            self._wait(_SLOT_RS + w - 2)
+            self._kernels.dma_add(
+                out.data_ptr(),
+                base + r * nbytes,
+                self._rs_scratch(self._local_ptr, w - 2, m_local),
+                numel,
+                _BF16_DTYPE_CODE,
             )
-            self._publish(_SLOT_RS)
-            self._ev_rs_copied.record(comm)
+            self._ev_rs_done.record(comm)
 
     def rs_wait_add(self, out: torch.Tensor, partial: torch.Tensor) -> None:
-        """out = partial[block rank] + peer's partial for my rows."""
-        assert out.is_contiguous() and out.dtype == self.layout.out_dtype
-        m_gathered, h = partial.shape
-        m_local = m_gathered // self.world_size
-        assert out.shape == (m_local, h)
-        nbytes = m_local * self.layout.out_row_bytes
+        """Block the current stream until `out` is complete and `partial`
+        (whose workspace may be recycled right after) is no longer read."""
+        del partial
         main = torch.cuda.current_stream(self.device)
-        self._wait(_SLOT_RS)
-        # The workspace holding `partial` may be recycled right after this
-        # call; make sure my outgoing copy is done reading it.
-        main.wait_event(self._ev_rs_copied)
-        self._kernels.dma_add(
-            out.data_ptr(),
-            partial.data_ptr() + self.rank * nbytes,
-            self._region(self._local_ptr, "rs"),
-            m_local * h,
-            _BF16_DTYPE_CODE,
-        )
+        main.wait_event(self._ev_rs_done)
         self.num_calls += 1
 
     # ---------------------------------------------------------------- teardown
@@ -463,11 +537,11 @@ def pcp_pcie_dma_disabled_by_env() -> bool:
 def get_pcp_pcie_dma_transport(
     layout: PcpPcieDmaLayout,
 ) -> PcpPcieDmaTransport | None:
-    """Create (once) the pair transport over vLLM's PCP group.
+    """Create (once) the ring transport over vLLM's PCP group.
 
-    Collective over the PCP pair.  Returns None on every rank of the pair
-    if any rank failed to initialise (consensus over the pair's CPU group),
-    so both ranks fall back to the NCCL path together.
+    Collective over the PCP group.  Returns None on every rank of the group
+    if any rank failed to initialise (consensus over the group's CPU group),
+    so all ranks fall back to the NCCL path together.
     """
     global _TRANSPORT, _TRANSPORT_FAILED
     if _TRANSPORT is not None:
@@ -505,7 +579,7 @@ def get_pcp_pcie_dma_transport(
             transport.close()
         _TRANSPORT_FAILED = True
         logger.warning(
-            "pcie_dma MoE transport unavailable on rank %d (%s); the PCP pair "
+            "pcie_dma MoE transport unavailable on rank %d (%s); the PCP group "
             "falls back to NCCL all-gather/reduce-scatter.",
             pcp.rank_in_group,
             error if error is not None else "failure on the peer rank",

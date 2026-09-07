@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""PrepareAndFinalize for expert parallelism across a CP2 pair over PCIe CE.
+"""PrepareAndFinalize for expert parallelism across a CP group over PCIe CE.
 
 Replaces MoERunner's NCCL all-gather of bf16 hidden states / router logits and
 NCCL reduce-scatter of the expert output with the copy-engine transport in
@@ -9,11 +9,12 @@ NCCL reduce-scatter of the expert output with the copy-engine transport in
 * prepare: quantize the LOCAL rows (fp8, 128-group scales) into this rank's
   slab block, all-gather the fp8 payload + scales + topk ids/weights (about
   half the bytes of the bf16 hidden states), hand the experts contiguous
-  [2M, ...] views of the slab.  The router therefore runs on the local rows
+  [W*M, ...] views of the slab.  The router therefore runs on the local rows
   only; hash-routed layers need no gathered input_ids.
-* finalize: reduce-scatter the bf16 partial sums with a CE copy plus a
-  first-touch add.  ``supports_async`` lets the modular kernel run the shared
-  experts between ``finalize_async`` and its receiver, i.e. under the RS copy.
+* finalize: ring reduce-scatter of the bf16 partial sums (CE copies plus
+  first-touch adds, all on the transport's comm stream).  ``supports_async``
+  lets the modular kernel run the shared experts between ``finalize_async``
+  and its receiver, i.e. under the whole exchange.
 """
 
 from __future__ import annotations
@@ -183,7 +184,7 @@ class PcpPcieDmaPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             weight_and_reduce_impl = TopKWeightAndReduceContiguous()
         if isinstance(weight_and_reduce_impl, TopKWeightAndReduceNoOP):
             # deep_gemm's unpermute already applied the topk weights and
-            # reduced over topk: [2M, H] partial sums.
+            # reduced over topk: [W*M, H] partial sums.
             partial = fused_expert_output
         else:
             m_gathered = fused_expert_output.shape[0]
@@ -206,7 +207,7 @@ class PcpPcieDmaPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             partial.shape,
             output.shape,
         )
-        tr.rs_publish(partial)
+        tr.rs_publish(partial, output)
 
         def receiver() -> None:
             tr.rs_wait_add(output, partial)

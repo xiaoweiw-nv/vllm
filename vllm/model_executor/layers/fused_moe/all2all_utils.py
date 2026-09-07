@@ -152,6 +152,7 @@ def _maybe_make_pcp_pcie_dma_prepare_finalize(
         ids_dtype=torch.int32,
         weights_dtype=torch.float32,
         out_dtype=moe.in_dtype,
+        world_size=moe.moe_parallel_config.pcp_size,
     )
     transport = get_pcp_pcie_dma_transport(layout)
     if transport is None:

@@ -1102,11 +1102,14 @@ class FusedMoEParallelConfig:
 
     @property
     def use_pcie_dma_kernels(self):
-        """EP across a prefill-context-parallel pair with the copy-engine
-        PCIe transport (dispatch/combine handled inside the modular kernel
-        instead of MoERunner's NCCL all-gather / reduce-scatter)."""
+        """EP across a prefill-context-parallel group (2 or 4 ranks) with the
+        copy-engine PCIe ring transport (dispatch/combine handled inside the
+        modular kernel instead of MoERunner's NCCL all-gather /
+        reduce-scatter)."""
         return (
-            self.use_ep and self.pcp_size == 2 and self.all2all_backend == "pcie_dma"
+            self.use_ep
+            and self.pcp_size in (2, 4)
+            and self.all2all_backend == "pcie_dma"
         )
 
     @property
