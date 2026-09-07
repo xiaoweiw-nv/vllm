@@ -536,4 +536,5 @@ class DeepseekCompressor(nn.Module):
             data_bytes,
             scale_bytes,
             expected_local_rows=local_rows // self.compress_ratio,
+            compress_ratio=self.compress_ratio,
         )

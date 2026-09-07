@@ -3,6 +3,8 @@
 """Packed-cache replication and C4 halo exchange for the fixed-shape
 DeepSeek-V4 CP x PP prototype (PCP world size 2 or 4, zigzag segments)."""
 
+import os
+
 import torch
 
 from vllm.distributed import get_pcp_group
@@ -86,6 +88,9 @@ def scatter_split_cache_rows_(
     pages[blocks[:, None], indices] = rows
 
 
+_CHECK_SLOTS = os.getenv("VLLM_DSV4_CP2PP4_CHECK_SLOTS", "0") == "1"
+
+
 def replicate_split_cache_rows_(
     cache: torch.Tensor,
     slot_mapping: torch.Tensor,
@@ -93,8 +98,22 @@ def replicate_split_cache_rows_(
     data_bytes: int,
     scale_bytes: int,
     expected_local_rows: int,
+    compress_ratio: int = 1,
 ) -> None:
-    """All-gather newly written packed rows and install them in every PCP replica."""
+    """All-gather newly written packed rows and install them in every PCP replica.
+
+    ``slot_mapping`` has one entry per local token (padding, if any, is -1 at
+    the tail); a compressed cache has a valid slot only for the token that
+    completes a ``compress_ratio`` block, i.e. positions with
+    ``(pos + 1) % ratio == 0``.  The zigzag segments are aligned to a multiple
+    of the ratio, so those are exactly the local rows ``ratio-1, 2*ratio-1,
+    ...`` — selected with a fixed strided view instead of a boolean mask.  The
+    mask version cost a CUB reduction plus a ``cudaStreamSynchronize`` per
+    call (2.4 per decoder layer), which drained the launch queue and left the
+    GPU idle ≈ 1 ms per layer (nsys, artifacts/cp4ep4pp2/RESULTS.md).
+    ``VLLM_DSV4_CP2PP4_CHECK_SLOTS=1`` re-enables the masked version as a
+    cross-check (synchronising).
+    """
     group = get_pcp_group()
     if group.world_size not in CP2PP4_SUPPORTED_WORLD_SIZES:
         raise RuntimeError(
@@ -102,14 +121,27 @@ def replicate_split_cache_rows_(
             f"{CP2PP4_SUPPORTED_WORLD_SIZES}, got {group.world_size}"
         )
 
-    local_slots = (
-        slot_mapping[slot_mapping >= 0].to(dtype=torch.int64).contiguous()
-    )
-    if local_slots.numel() != expected_local_rows:
+    needed = expected_local_rows * compress_ratio
+    if slot_mapping.shape[0] < needed:
         raise RuntimeError(
-            f"CP2PP4 expected {expected_local_rows} cache rows, "
-            f"got {local_slots.numel()}"
+            f"CP2PP4 expected {needed} slot-mapping entries for "
+            f"{expected_local_rows} cache rows at ratio {compress_ratio}, "
+            f"got {slot_mapping.shape[0]}"
         )
+    local_slots = (
+        slot_mapping[compress_ratio - 1 : needed : compress_ratio]
+        .to(dtype=torch.int64)
+        .contiguous()
+    )
+    if _CHECK_SLOTS:
+        masked = slot_mapping[slot_mapping >= 0].to(dtype=torch.int64)
+        if masked.numel() != expected_local_rows or not torch.equal(
+            masked, local_slots
+        ):
+            raise RuntimeError(
+                "CP2PP4 strided slot selection disagrees with the >= 0 mask: "
+                f"expected {expected_local_rows} rows, mask has {masked.numel()}"
+            )
     local_rows = pack_split_cache_rows(
         cache, local_slots, block_size, data_bytes, scale_bytes
     )
