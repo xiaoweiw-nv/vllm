@@ -325,7 +325,7 @@ def _reshape_kv_cache(
                 # quantized cache dtype's (possibly packed) layout.
                 layer_cache_dtype = (
                     "auto"
-                    if cache_dtype != "fp8_ds_mla"
+                    if cache_dtype not in ("fp8_ds_mla", "nvfp4_fi_ds_mla")
                     and kv_cache_spec.kv_quant_mode == KVQuantMode.NONE
                     and not isinstance(kv_cache_spec, TQFullAttentionSpec)
                     else cache_dtype
@@ -495,7 +495,7 @@ def _update_hybrid_attention_layout(
         # but it keeps both call sites consistent for skip layers.
         layer_cache_dtype = (
             "auto"
-            if cache_dtype != "fp8_ds_mla"
+            if cache_dtype not in ("fp8_ds_mla", "nvfp4_fi_ds_mla")
             and kv_cache_spec.kv_quant_mode == KVQuantMode.NONE
             and not isinstance(kv_cache_spec, TQFullAttentionSpec)
             else cache_dtype

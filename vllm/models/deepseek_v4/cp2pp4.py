@@ -44,6 +44,19 @@ def _packed_row_byte_indices(
     return torch.cat((data, scales), dim=1)
 
 
+def packed_row_bytes(kv_cache_dtype: str) -> tuple[int, int]:
+    """``(data_bytes, scale_bytes)`` per token of a packed DeepSeek-V4 512-dim
+    KV page: ``fp8_ds_mla`` (SM120 FlashInfer / FlashMLA UE8M0 layout) stores
+    576 data + 8 scale bytes; FlashInfer's NVFP4 sparse-MLA page
+    (``nvfp4_fi_ds_mla``) stores 352 data (224 E2M1 + 128 bf16 RoPE) + 32
+    scale bytes. Both are page-major: all data rows, then all scale rows."""
+    if kv_cache_dtype == "fp8_ds_mla":
+        return 576, 8
+    if kv_cache_dtype == "nvfp4_fi_ds_mla":
+        return 352, 32
+    raise ValueError(f"not a packed DeepSeek-V4 KV layout: {kv_cache_dtype!r}")
+
+
 def pack_split_cache_rows(
     cache: torch.Tensor,
     slots: torch.Tensor,

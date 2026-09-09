@@ -1052,8 +1052,10 @@ class VllmConfig:
             self._verify_dsv4_cp2ep2pp4_groups(mode)
         if self.cache_config.enable_prefix_caching:
             raise ValueError(f"{mode} requires prefix caching disabled")
-        if self.cache_config.cache_dtype != "fp8_ds_mla":
-            raise ValueError(f"{mode} requires --kv-cache-dtype fp8_ds_mla")
+        if self.cache_config.cache_dtype not in ("fp8_ds_mla", "nvfp4_fi_ds_mla"):
+            raise ValueError(
+                f"{mode} requires --kv-cache-dtype fp8_ds_mla or nvfp4_fi_ds_mla"
+            )
         if not scheduler.enable_chunked_prefill:
             raise ValueError(f"{mode} requires chunked prefill enabled")
         if scheduler.async_scheduling:

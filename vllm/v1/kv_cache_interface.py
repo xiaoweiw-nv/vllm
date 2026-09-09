@@ -490,6 +490,12 @@ class MLAAttentionSpec(FullAttentionSpec):
                 # model_type=glm_moe_dsa. DeepSeek-V4 and V3.2 stay stock.
                 return self.block_size * 368
             return self.block_size * 432
+        if self.cache_dtype_str == "nvfp4_fi_ds_mla":
+            # DeepseekV4 FlashInfer SM120 NVFP4 sparse-MLA cache: 384 B/token
+            # (224B E2M1 NoPE + 32B E4M3 group-16 scales + 128B bf16 RoPE,
+            # stored page-major as data region then scale region).
+            assert self.model_version == "deepseek_v4", self.model_version
+            return self.storage_block_size * 384
         if self.cache_dtype_str == "fp8_ds_mla":
             if self.model_version == "deepseek_v4":
                 # DeepseekV4: 448B NoPE + 128B RoPE + 8B fp8 scale = 584B per token.
@@ -742,6 +748,12 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
             # per token. FlashInfer's contiguous bf16/fp8 cache falls through to
             # the element-size formula below.
             return self.storage_block_size * 584
+        if (
+            self.model_version == "deepseek_v4"
+            and self.cache_dtype_str == "nvfp4_fi_ds_mla"
+        ):
+            # FlashInfer SM120 NVFP4 sparse-MLA cache: 384 B/token.
+            return self.storage_block_size * 384
         assert self.model_version in (None, "deepseek_v4"), (
             f"Unsupported model version: {self.model_version}"
         )

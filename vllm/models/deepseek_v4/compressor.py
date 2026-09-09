@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any, ClassVar, cast
 
 import torch
@@ -17,7 +18,10 @@ from vllm.models.deepseek_v4.common.ops.fused_compress_quant_cache import (
     compress_norm_rope_store_two_stage_triton,
 )
 from vllm.models.deepseek_v4.common.ops.fused_indexer_q import MXFP4_BLOCK_SIZE
-from vllm.models.deepseek_v4.cp2pp4 import replicate_split_cache_rows_
+from vllm.models.deepseek_v4.cp2pp4 import (
+    packed_row_bytes,
+    replicate_split_cache_rows_,
+)
 from vllm.models.deepseek_v4.common.ops.save_partial_states import (
     save_partial_states,
 )
@@ -377,6 +381,34 @@ class DeepseekCompressor(nn.Module):
         k_cache_layer = self._static_forward_context[self.k_cache_prefix]
         kv_cache = k_cache_layer.kv_cache
 
+        # FlashInfer SM120 NVFP4 packed cache (nvfp4_fi_ds_mla): the CuTe
+        # compress kernel writes bf16 full rows (RMSNorm + RoPE applied) into a
+        # single-token-page staging buffer, then FlashInfer quantize-appends
+        # them into the paged 384 B/token cache by physical slot.
+        nvfp4_fi_cache = (
+            self.head_dim == 512
+            and getattr(k_cache_layer, "kv_cache_dtype", None) == "nvfp4_fi_ds_mla"
+        )
+        nvfp4_fi_kv_cache = kv_cache
+        nvfp4_fi_slot_mapping = None
+        if nvfp4_fi_cache:
+            if not current_platform.is_cuda() or dcp_world_size > 1:
+                raise NotImplementedError(
+                    "nvfp4_fi_ds_mla compressor store needs the CUDA CuTe path"
+                )
+            nvfp4_fi_slot_mapping = k_cache_metadata.slot_mapping[:num_actual]
+            assert nvfp4_fi_slot_mapping.shape[0] == num_actual
+            kv_cache = torch.empty(
+                (num_actual, 1, self.head_dim),
+                dtype=torch.bfloat16,
+                device=state_cache.device,
+            )
+            k_cache_metadata = SimpleNamespace(
+                slot_mapping=torch.arange(
+                    num_actual, dtype=torch.int64, device=state_cache.device
+                )
+            )
+
         # Plain-row V4 reads a contiguous bf16 / per-tensor fp8 cache row; the
         # fp8_ds_mla path uses the UE8M0 paged uint8 layout.
         store_full_kv = self.head_dim == 512 and kv_cache.dtype != torch.uint8
@@ -464,6 +496,15 @@ class DeepseekCompressor(nn.Module):
             scale_dim=self._scale_dim,
             **extra_kwargs,
         )
+        if nvfp4_fi_cache:
+            from flashinfer.mla import nvfp4_quantize_append_sparse_mla_cache
+
+            assert nvfp4_fi_slot_mapping is not None
+            nvfp4_quantize_append_sparse_mla_cache(
+                kv_cache.view(num_actual, self.head_dim),
+                nvfp4_fi_slot_mapping.contiguous(),
+                nvfp4_fi_kv_cache,
+            )
 
     def write_cp2pp4_halo(
         self,
@@ -519,8 +560,9 @@ class DeepseekCompressor(nn.Module):
         k_cache_layer = self._static_forward_context[self.k_cache_prefix]
 
         if self.head_dim == 512:
-            data_bytes = 576
-            scale_bytes = 8
+            data_bytes, scale_bytes = packed_row_bytes(
+                getattr(k_cache_layer, "kv_cache_dtype", "fp8_ds_mla")
+            )
         elif self.head_dim == 128:
             data_bytes = 128
             scale_bytes = 4

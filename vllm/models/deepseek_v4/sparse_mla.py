@@ -101,6 +101,9 @@ class DeepseekV4FlashMLABackend(AttentionBackend):
             # DeepseekV4 main MLA: 584B per token (448 NoPE + 128 RoPE + 8 fp8 scale).
             # head_size passed in is the semantic head_dim (512).
             return (num_blocks, block_size, 584)
+        elif cache_dtype_str == "nvfp4_fi_ds_mla":
+            # FlashInfer SM120 NVFP4 sparse-MLA cache: 384B per token.
+            return (num_blocks, block_size, 384)
         else:
             return (num_blocks, block_size, head_size)
 

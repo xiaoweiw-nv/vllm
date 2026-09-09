@@ -57,6 +57,7 @@ from vllm.models.deepseek_v4.compressor import DeepseekCompressor
 from vllm.models.deepseek_v4.cp2pp4 import (
     exchange_cp2pp4_boundary_halo,
     get_effective_cache_shard_count,
+    packed_row_bytes,
     replicate_split_cache_rows_,
 )
 from vllm.utils.math_utils import cdiv
@@ -95,6 +96,11 @@ def _resolve_dsv4_kv_cache_dtype(
     token's KV row in its element dtype: bf16 or per-tensor FP8 E4M3.
     """
     if use_fp8_ds_mla_layout:
+        if kv_cache_dtype == "nvfp4_fi_ds_mla":
+            # FlashInfer SM120 NVFP4 packed sparse-MLA cache (384 B/token,
+            # uint8). Same paged/packed contract as fp8_ds_mla, different
+            # per-token record; see DeepseekV4FlashInferSM120Attention.
+            return kv_cache_dtype, torch.uint8
         # fp8_ds_mla block format: UE8M0 block-scaled fp8 packed as uint8.
         assert kv_cache_dtype.startswith("fp8"), (
             f"DeepseekV4 fp8_ds_mla layout only supports fp8 kv-cache, "
@@ -764,12 +770,13 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 "DeepseekSparseSWAMetadata",
                 attn_metadata[self.swa_cache_layer.prefix],
             )
+            swa_data_bytes, swa_scale_bytes = packed_row_bytes(self.kv_cache_dtype)
             replicate_split_cache_rows_(
                 self.swa_cache_layer.kv_cache,
                 swa_metadata.slot_mapping,
                 swa_metadata.block_size,
-                data_bytes=576,
-                scale_bytes=8,
+                data_bytes=swa_data_bytes,
+                scale_bytes=swa_scale_bytes,
                 expected_local_rows=expected_local_rows,
             )
             if self.compressor is not None:
@@ -778,6 +785,69 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         # MLA attention writes into the pre-allocated `out` buffer
         # ([num_tokens, padded_heads, head_dim]).
         self.forward_mqa(q, kv, positions, out)
+
+    def _nvfp4_fi_staging_slots(
+        self, num_tokens: int, device: torch.device
+    ) -> torch.Tensor:
+        """``arange(num_tokens)`` int64, cached: staging slot i <- input row i."""
+        slots = getattr(self, "_nvfp4_fi_slots", None)
+        if slots is None or slots.numel() < num_tokens or slots.device != device:
+            slots = torch.arange(
+                max(num_tokens, self.max_num_batched_tokens),
+                dtype=torch.int64,
+                device=device,
+            )
+            self._nvfp4_fi_slots = slots
+        return slots[:num_tokens]
+
+    def _nvfp4_fi_qnorm_rope_kv_insert(
+        self,
+        q: torch.Tensor,
+        kv: torch.Tensor,
+        positions: torch.Tensor,
+        swa_metadata: "DeepseekSparseSWAMetadata",
+        swa_kv_cache: torch.Tensor,
+        cos_sin_cache: torch.Tensor,
+    ) -> torch.Tensor:
+        """FlashInfer SM120 NVFP4 sparse-MLA cache write.
+
+        Q side is identical to the plain-row path (per-head RMSNorm + RoPE in
+        place). The KV row is RoPE'd in bf16 by the plain-row insert kernel into
+        a per-call staging buffer laid out as one single-token page per input
+        row, then FlashInfer quantizes (448 NoPE dims -> group-16 E2M1 + E4M3
+        scales; 64 RoPE dims stay bf16) and appends it into the paged 384 B/token
+        cache by physical slot. Negative (padding) slots are skipped by the
+        append kernel.
+        """
+        from flashinfer.mla import nvfp4_quantize_append_sparse_mla_cache
+
+        num_tokens = kv.shape[0]
+        staging = torch.empty(
+            (num_tokens, 1, self.head_dim), dtype=torch.bfloat16, device=kv.device
+        )
+        torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_bf16_insert(
+            q,
+            kv,
+            staging,
+            self._nvfp4_fi_staging_slots(num_tokens, kv.device),
+            positions,
+            cos_sin_cache,
+            self.eps,
+            1,  # block_size of the staging "cache": one token per page
+        )
+        slot_mapping = swa_metadata.slot_mapping[:num_tokens]
+        assert slot_mapping.shape[0] == num_tokens, (
+            f"SWA slot_mapping has {swa_metadata.slot_mapping.shape[0]} rows, "
+            f"need {num_tokens}"
+        )
+        nvfp4_quantize_append_sparse_mla_cache(
+            staging.view(num_tokens, self.head_dim),
+            slot_mapping.contiguous(),
+            swa_kv_cache,
+        )
+        if self.n_local_heads < self.padded_heads:
+            q = F.pad(q, (0, 0, 0, self.padded_heads - self.n_local_heads), value=0.0)
+        return q
 
     def _fused_qnorm_rope_kv_insert(
         self,
@@ -813,6 +883,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         cache_dtype = swa_kv_cache.dtype
 
         # kv is unchanged; attention reads kv solely via swa_kv_cache.
+        if self.kv_cache_dtype == "nvfp4_fi_ds_mla":
+            return self._nvfp4_fi_qnorm_rope_kv_insert(
+                q, kv, positions, swa_metadata, swa_kv_cache, cos_sin_cache
+            )
         if cache_dtype == torch.uint8:
             # fp8_ds_mla UE8M0 paged path. Horizontally fused:
             #   Q side:  per-head RMSNorm (no weight) + GPT-J RoPE, zero-filling
@@ -877,17 +951,34 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         ):  # SWA part. Allocated separately as DeepseekV4SWACache.
             return None
         # fp8_ds_mla is a UE8M0 block-scaled uint8 layout and needs 576B
-        # alignment; plain bf16 / per-tensor fp8 rows use natural element-size
+        # alignment; the FlashInfer NVFP4 packed layout is 384 B/token (no-op
+        # alignment); plain bf16 / per-tensor fp8 rows use natural element-size
         # pages.
         uses_fp8_ds_mla_layout = self.kv_cache_dtype == "fp8_ds_mla"
+        uses_nvfp4_fi_layout = self.kv_cache_dtype == "nvfp4_fi_ds_mla"
         return MLAAttentionSpec(
             block_size=vllm_config.cache_config.block_size,
             num_kv_heads=1,
             head_size=self.head_dim,
-            dtype=torch.uint8 if uses_fp8_ds_mla_layout else self.kv_cache_torch_dtype,
+            dtype=(
+                torch.uint8
+                if uses_fp8_ds_mla_layout or uses_nvfp4_fi_layout
+                else self.kv_cache_torch_dtype
+            ),
             compress_ratio=self.compress_ratio,
             cache_dtype_str=self.kv_cache_dtype,
-            alignment=576 if uses_fp8_ds_mla_layout else 512,
+            # NVFP4: the hybrid KV manager pads every other group's page up to a
+            # page size of this (first) group, so the C4A page must stay >= the
+            # compressor state page (4 x 8192 B = 32768). 33024 = 86 x 384 keeps
+            # the block stride a whole number of 384 B rows (FlashInfer accepts
+            # page-strided pools). C128A pages (2 rows) stay unpadded.
+            alignment=(
+                576
+                if uses_fp8_ds_mla_layout
+                else (33024 if self.compress_ratio == 4 else 384)
+                if uses_nvfp4_fi_layout
+                else 512
+            ),
             model_version="deepseek_v4",
             kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
             dcp_replicated=dsv4_cp2pp_fixed_shape_enabled(),

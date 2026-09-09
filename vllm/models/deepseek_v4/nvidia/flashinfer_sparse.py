@@ -123,7 +123,12 @@ class DeepseekV4FlashInferMLASparseBackend(DeepseekV4FlashMLABackend):
                 return "kv_cache_dtype not supported"
             return None
         if device_capability.major == 12:
-            if kv_cache_dtype not in ("fp8", "fp8_e4m3", "fp8_ds_mla"):
+            if kv_cache_dtype not in (
+                "fp8",
+                "fp8_e4m3",
+                "fp8_ds_mla",
+                "nvfp4_fi_ds_mla",
+            ):
                 return "kv_cache_dtype not supported"
             from vllm.utils.flashinfer import has_flashinfer_sparse_mla_sm120
 
@@ -544,6 +549,12 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
             return kv_cache
         return kv_cache.unsqueeze(-2)
 
+    @property
+    def _flashinfer_kv_cache_format(self) -> str:
+        """``kv_cache_format`` for FlashInfer's SM120 sparse-MLA entry point:
+        ``"nvfp4"`` for the 384 B/token NVFP4 packed cache, else ``"fp8"``."""
+        return "nvfp4" if self.kv_cache_dtype == "nvfp4_fi_ds_mla" else "fp8"
+
     @classmethod
     def get_padded_num_q_heads(cls, num_heads: int) -> int:
         if num_heads <= 16:
@@ -780,6 +791,7 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
             swa_topk_lens=swa_lens,
             extra_sparse_indices=extra_sparse_indices,
             extra_sparse_topk_lens=extra_sparse_lengths,
+            kv_cache_format=self._flashinfer_kv_cache_format,
         )
 
     def _forward_prefill(
@@ -899,4 +911,5 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                 swa_topk_lens=swa_lens_chunk,
                 extra_sparse_indices=extra_sparse_indices_chunk,
                 extra_sparse_topk_lens=extra_sparse_lengths_chunk,
+                kv_cache_format=self._flashinfer_kv_cache_format,
             )

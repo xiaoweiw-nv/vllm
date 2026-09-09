@@ -39,6 +39,8 @@ def _needs_triton_warmup(compressor: nn.Module, dcp_world_size: int) -> bool:
 def _kv_cache_last_dim(spec: MLAAttentionSpec) -> int:
     if spec.cache_dtype_str == "fp8_ds_mla" and spec.model_version == "deepseek_v4":
         return 584
+    if spec.cache_dtype_str == "nvfp4_fi_ds_mla" and spec.model_version == "deepseek_v4":
+        return 384
     return spec.head_size
 
 

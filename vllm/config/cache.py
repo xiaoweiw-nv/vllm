@@ -26,6 +26,10 @@ CacheDType = Literal[
     "fp8_inc",
     "fp8_ds_mla",
     "nvfp4_ds_mla",
+    # DeepSeek-V4 sparse MLA on SM120 via FlashInfer's NVFP4 packed cache
+    # (384 B/token: 448 NoPE dims as group-16 E2M1 + E4M3 scales, 64 RoPE dims
+    # bf16). Consumed only by FLASHINFER_MLA_SPARSE_DSV4 on SM12x.
+    "nvfp4_fi_ds_mla",
     "turboquant_k8v4",
     "turboquant_4bit_nc",
     "turboquant_k3v4_nc",
