@@ -1,0 +1,17 @@
+# Gate-1 image: stage4a-v2 e2e image + FlashInfer upstream main @ FI_SHA (contains PR #4955
+# NVFP4 sparse MLA + #4676). Source install, JIT-only (0.6.14 jit-cache/cubin removed so no
+# stale AOT kernels can be picked up). Deps untouched (--no-deps): image already satisfies
+# main's requirements.txt except the cutlass-dsl metadata floor (4.6.0 < 4.6.2a0), kept on
+# purpose because b12x/pcie_dma CuTe kernels were validated on 4.6.0.
+FROM vllm:cp4ep4pp2-fe100040f
+ARG FI_SHA
+LABEL codex.fi-nvfp4.flashinfer_sha=${FI_SHA} codex.fi-nvfp4.owner=xiaoweiw
+COPY flashinfer-src /opt/flashinfer-src
+ENV BUILD_NVEP=0 BUILD_NIXL_EP=0 BUILD_NCCL_EP=0 FLASHINFER_BUILD_NO_PIP=1
+RUN set -e; \
+    /opt/venv/bin/pip uninstall -y flashinfer-jit-cache flashinfer-cubin flashinfer-python; \
+    cd /opt/flashinfer-src && /opt/venv/bin/pip install --no-build-isolation --no-deps -v . 2>&1 | tail -5; \
+    /opt/venv/bin/python -c "import flashinfer; print('flashinfer', flashinfer.__version__)"
+# fresh JIT workspace: never mix with the 0.6.14 compiled modules
+ENV FLASHINFER_WORKSPACE_BASE=/cache/jit/fi-main-nvfp4/flashinfer \
+    VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR=/cache/jit/fi-main-nvfp4/flashinfer-autotune

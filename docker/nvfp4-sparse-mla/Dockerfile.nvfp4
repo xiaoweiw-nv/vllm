@@ -1,0 +1,12 @@
+# NVFP4 sparse-MLA e2e image: fimain (FlashInfer main 866acb62 incl. PR #4955) + vLLM branch
+# nvfp4-sparse-mla overlay (new --kv-cache-dtype nvfp4_fi_ds_mla for FLASHINFER_MLA_SPARSE_DSV4 on SM120).
+FROM vllm:cp4ep4pp2-flashinfer-866acb62
+LABEL codex.fi-nvfp4.vllm_branch=nvfp4-sparse-mla codex.fi-nvfp4.owner=xiaoweiw
+COPY vllm/ /opt/vllm-src/vllm/
+RUN set -e; cd /opt/vllm-src; \
+    find vllm -name '__pycache__' -type d -prune -exec rm -rf {} + ; \
+    /opt/venv/bin/python -m py_compile vllm/models/deepseek_v4/attention.py vllm/models/deepseek_v4/compressor.py \
+        vllm/models/deepseek_v4/cp2pp4.py vllm/models/deepseek_v4/nvidia/flashinfer_sparse.py; \
+    grep -q 'nvfp4_fi_ds_mla' vllm/config/cache.py vllm/v1/kv_cache_interface.py vllm/models/deepseek_v4/attention.py \
+        vllm/models/deepseek_v4/compressor.py vllm/models/deepseek_v4/nvidia/flashinfer_sparse.py; \
+    /opt/venv/bin/python -c "import vllm.models.deepseek_v4.cp2pp4 as m; assert m.packed_row_bytes('nvfp4_fi_ds_mla')==(352,32); assert m.packed_row_bytes('fp8_ds_mla')==(576,8); print('overlay ok')"

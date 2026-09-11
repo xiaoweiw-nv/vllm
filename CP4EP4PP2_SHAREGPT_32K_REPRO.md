@@ -246,3 +246,87 @@ FlashInfer-main variant. Each layer's copied files were verified identical to th
 branch tree (formatting-only differences in two files). Results, drivers and nsys
 analyses live outside this repository under `artifacts/cp4ep4pp2/` and
 `artifacts/fi-nvfp4/` of the working directory.
+
+## NVFP4 KV cache (branch `nvfp4-sparse-mla`, experimental)
+
+This branch adds `--kv-cache-dtype nvfp4_fi_ds_mla`, which stores the sparse-MLA
+KV cache in FlashInfer's NVFP4 packed format (384 B/token: the 448 NoPE dims as
+group-16 E2M1 with E4M3 scales, the 64 RoPE dims in bf16; `fp8_ds_mla` is 584
+B/token) and runs the NVFP4 sparse-MLA prefill/decode kernels from FlashInfer
+PR #4955 (`flashinfer-ai/flashinfer` merge `ab6d2c89`, 2026-09-07). It is a
+numerics change, not a pure kernel swap: the KV cache is quantized to 4 bits.
+**Not validated for deployment.** Measured effects, CP4·EP4·PP2 arm as above,
+FP8 and NVFP4 on the same FlashInfer build:
+
+| workload | FP8 (`fp8_ds_mla`) | NVFP4 (`nvfp4_fi_ds_mla`) | Δ |
+| --- | ---: | ---: | ---: |
+| ShareGPT-32K ×8 mean TTFT | 1068.1 ms | **1009.5 ms** | −5.5% |
+| random-32K ×8 mean TTFT | 1134.0 ms | 1083.4 ms | −4.5% |
+| KV capacity in the 10 GiB budget | 364,513 tokens | 409,168 tokens | +12% |
+
+Accuracy so far (teacher-forced scoring of 32 further 32K ShareGPT prompts,
+1.05 M next-token predictions, plain PP4 server because the CP path rejects
+`prompt_logprobs`): NLL +0.00217 nat (+0.26%, perplexity 2.299 → 2.304), next-token
+accuracy 77.72% → 77.63%, top-1 agreement with FP8 96.4% (the FP8-vs-FP8 floor
+across two FlashInfer versions is 97.7%), flat over 0–32K context depth. One-token
+greedy outputs matched FP8 on all test prompts. Multi-token generation and
+task-level evaluations have not been run.
+
+### Additional requirements
+
+* FlashInfer **upstream `main` at `866acb62d31c8dfa9c1e8b1aebc8fea5957279b5`**
+  (PR #4955 plus the NVFP4 quantize-append follow-up #4676) installed from source.
+  The PyPI 0.6.14 wheels in the base image do not contain these kernels, and the
+  PR does not cherry-pick onto 0.6.14. Build the intermediate image with
+  [`docker/nvfp4-sparse-mla/Dockerfile.flashinfer-main`](docker/nvfp4-sparse-mla/Dockerfile.flashinfer-main):
+
+  ```bash
+  git clone https://github.com/flashinfer-ai/flashinfer.git flashinfer-src
+  git -C flashinfer-src checkout 866acb62d31c8dfa9c1e8b1aebc8fea5957279b5
+  git -C flashinfer-src submodule update --init 3rdparty/cutlass 3rdparty/spdlog 3rdparty/cccl
+  docker build -f docker/nvfp4-sparse-mla/Dockerfile.flashinfer-main \
+    --build-arg FI_SHA=866acb62d31c8dfa9c1e8b1aebc8fea5957279b5 \
+    -t vllm:cp4ep4pp2-flashinfer-866acb62 .
+  ```
+
+  This removes `flashinfer-jit-cache`/`flashinfer-cubin` 0.6.14 (so no stale
+  AOT kernels are picked up) and installs `flashinfer-python 0.6.18+cu132` with
+  `--no-deps`; the image already satisfies FlashInfer main's requirements
+  (`nvidia-cutlass-dsl 4.6.0` is below main's declared floor of 4.6.2a0 but works
+  for these kernels). All kernels are JIT-compiled on first use (≈1–2 minutes at
+  the first request; mount a persistent `/cache` to keep them).
+* This branch's vLLM tree over that image
+  ([`docker/nvfp4-sparse-mla/Dockerfile.nvfp4`](docker/nvfp4-sparse-mla/Dockerfile.nvfp4), build context = this repository root).
+* Sanity checks that need one GPU and no server:
+  `docker/nvfp4-sparse-mla/test_staging_append.py` verifies that vLLM's cache
+  write path (bf16 RoPE insert into a staging buffer followed by FlashInfer's
+  `nvfp4_quantize_append_sparse_mla_cache`) is byte-identical to FlashInfer's
+  reference `nvfp4_quantize_pack_sparse_mla_cache`; FlashInfer's own
+  `tests/attention/test_sparse_mla_nvfp4_sm120.py` (29 selected tests) and
+  `benchmarks/bench_sparse_mla_nvfp4_prefill.py --num-tokens 4096 --num-heads 64
+  --topk 128 --extra-topk 512 --extra-page-size 64` (expect ≈1.38× over FP8 on
+  this GPU) exercise the kernels themselves.
+
+### Running
+
+Same `docker run` as above with `--kv-cache-dtype nvfp4_fi_ds_mla` and the NVFP4
+image. Startup logs `GPU KV cache size: 409,168 tokens` (FP8: 364,513). The
+C4A compressed-KV pages are padded to 33,024 B so that vLLM's hybrid KV-cache
+grouping still fits the compressor state pages (32,768 B); this padding is why
+the capacity gain is +12% rather than the +34% the byte format allows.
+`docker/nvfp4-sparse-mla/grouping_probe.py` reproduces the grouping decision on
+CPU in seconds if you change any page geometry.
+
+### What changed in vLLM (12 files, commit on this branch)
+
+`vllm/config/cache.py`, `vllm/utils/torch_utils.py`: the new dtype string.
+`vllm/v1/kv_cache_interface.py`, `vllm/models/deepseek_v4/sparse_mla.py`,
+`vllm/v1/attention/backends/mla/sparse_swa.py`: 384 B/token page geometry.
+`vllm/models/deepseek_v4/attention.py`, `vllm/models/deepseek_v4/compressor.py`:
+SWA and compressed-cache write paths (bf16 staging + FlashInfer quantize-append),
+the C4A page alignment. `vllm/models/deepseek_v4/nvidia/flashinfer_sparse.py`:
+`kv_cache_format="nvfp4"` on both SM120 `trtllm_batch_decode_sparse_mla_dsv4`
+call sites. `vllm/models/deepseek_v4/cp2pp4.py`: packed-row byte layout
+(352 + 32) for CP replication. `vllm/config/vllm.py`,
+`vllm/v1/worker/gpu/attn_utils.py`, `deepseek_v4_compressor_warmup.py`: accept
+the dtype in the CP2PP4 config check, cache-shape plumbing and the warmup.
