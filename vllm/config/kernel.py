@@ -130,6 +130,7 @@ MoEBackend = Literal[
     "flashinfer_trtllm",
     "flashinfer_cutlass",
     "flashinfer_cutedsl",
+    "flashinfer_sm12x",
     "flashinfer_b12x",
     "marlin",
     "humming",
@@ -197,6 +198,7 @@ class KernelConfig:
     - "flashinfer_trtllm": Use FlashInfer with TRTLLM-GEN kernels
     - "flashinfer_cutlass": Use FlashInfer with CUTLASS kernels
     - "flashinfer_cutedsl": Use FlashInfer with CuteDSL kernels (FP4 only)
+    - "flashinfer_sm12x": Use fused SM12x MXFP4 experts with FP8 activations
     - "flashinfer_b12x": Use FlashInfer CuteDSL fused MoE for SM12x
       (RTX Pro 6000 / DGX Spark)
     - "marlin": Use Marlin kernels (weight-only quantization)

@@ -1,0 +1,134 @@
+{
+  "workload": {
+    "dataset": "ShareGPT custom fixture",
+    "dataset_sha256": "a5d0ec89b42c5b31fabb47a6ec692e4d07e2403b3e4b36dedb4bb266cabc41bd",
+    "input_tokens_per_request": 32768,
+    "output_tokens_per_request": 1,
+    "requests": 8,
+    "concurrency": 1,
+    "seed": 42,
+    "cp": 4,
+    "ep": 4,
+    "pp": 2,
+    "pp_partition": [
+      22,
+      21
+    ],
+    "max_batched_tokens": 4096,
+    "prefix_caching": false,
+    "kv_cache_bytes_per_rank": 10737418240,
+    "transport": "pcie_dma",
+    "cuda_graph_mode": "PIECEWISE",
+    "capture_sizes": [
+      512,
+      1024
+    ]
+  },
+  "flashinfer_fused_commit": "61503db7ee6442e393ed119662f4d066d5098524",
+  "fp8_pair": {
+    "rig": "rig-9",
+    "date_utc": "2026-09-11",
+    "kv_cache_dtype": "fp8_ds_mla",
+    "image_id": "sha256:66956f5d91c273108833accc34dc134e2e7ab60d85c18ed5406501c0360fd480",
+    "deep_gemm": {
+      "mean_ttft_ms": 1182.1011064457707,
+      "median_ttft_ms": 1182.9552431590855,
+      "p99_ttft_ms": 1184.9489034852013,
+      "std_ttft_ms": 2.815001105623815,
+      "completed": 8,
+      "failed": 0
+    },
+    "flashinfer_sm12x": {
+      "mean_ttft_ms": 1108.5917971213348,
+      "median_ttft_ms": 1109.0892953798175,
+      "p99_ttft_ms": 1112.8377902554348,
+      "std_ttft_ms": 3.0581064281095207,
+      "completed": 8,
+      "failed": 0
+    },
+    "same_image": true,
+    "same_command_except_backend": true,
+    "ttft_reduction_percent": 6.218529779187564,
+    "contention_limit": "Original sampler excluded every VLLM process name; foreign VLLM contention cannot be ruled out."
+  },
+  "fp8_fused_single": {
+    "rig": "rig-16",
+    "date_utc": "2026-09-11",
+    "kv_cache_dtype": "fp8_ds_mla",
+    "image_id": "sha256:33cec7a692b0cea866e92e9ce8eed4f7072198e5511fc88bc57ff4ac4eb0cc00",
+    "flashinfer_sm12x": {
+      "mean_ttft_ms": 1002.2707418756909,
+      "median_ttft_ms": 1001.3696165115107,
+      "p99_ttft_ms": 1009.117787834257,
+      "std_ttft_ms": 3.3087244013635106,
+      "completed": 8,
+      "failed": 0
+    },
+    "measured_foreign_process_samples": 0,
+    "matched_deepgemm_control": false
+  },
+  "nvfp4_pair": {
+    "rig": "rig-16",
+    "date_utc": "2026-09-12",
+    "kv_cache_dtype": "nvfp4_fi_ds_mla",
+    "image_id": "sha256:c862e65c9cf0d6c18f9b8d96c24d5d6769c8dafa684871085ddcae36ac4ce2ab",
+    "deep_gemm": {
+      "mean_ttft_ms": 1000.7474093799829,
+      "median_ttft_ms": 999.6508174808696,
+      "p99_ttft_ms": 1009.3504625780043,
+      "std_ttft_ms": 4.4245175991392705,
+      "completed": 8,
+      "failed": 0
+    },
+    "flashinfer_sm12x": {
+      "mean_ttft_ms": 939.2151240026578,
+      "median_ttft_ms": 939.0395990049001,
+      "p99_ttft_ms": 947.0063780178316,
+      "std_ttft_ms": 3.6548904215463183,
+      "completed": 8,
+      "failed": 0
+    },
+    "same_image": true,
+    "same_environment": true,
+    "same_command_except_backend": true,
+    "measured_foreign_process_samples": 0,
+    "contention_sampler": "Host PID ownership, one-second intervals",
+    "ttft_reduction_percent": 6.148632991760383,
+    "smoke": [
+      {
+        "prompt": "const_1000_32768",
+        "tokens_match": true,
+        "chosen_logprob_abs_diff": 0.000005483578661369393,
+        "top5_overlap": 3,
+        "top5_common_max_abs_diff": 1.6249942779541016
+      },
+      {
+        "prompt": "const_2000_4096",
+        "tokens_match": true,
+        "chosen_logprob_abs_diff": 0.0002159872092306614,
+        "top5_overlap": 4,
+        "top5_common_max_abs_diff": 0.9997835159301758
+      },
+      {
+        "prompt": "rand_0_4096_1000_50000",
+        "tokens_match": true,
+        "chosen_logprob_abs_diff": 0.3408060073852539,
+        "top5_overlap": 4,
+        "top5_common_max_abs_diff": 0.3408060073852539
+      },
+      {
+        "prompt": "rand_1_6144_1000_50000",
+        "tokens_match": false,
+        "chosen_logprob_abs_diff": 0.006520271301269531,
+        "top5_overlap": 4,
+        "top5_common_max_abs_diff": 0.24347972869873047
+      }
+    ]
+  },
+  "validation": {
+    "fused_gpu_tests_passed": 8,
+    "nvfp4_staging_append": "passed",
+    "combined_path_full_model_accuracy": "not evaluated",
+    "note": "One-token smoke is not bitwise equivalence; 3/4 first tokens match for the NVFP4 pair."
+  }
+}

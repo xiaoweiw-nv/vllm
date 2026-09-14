@@ -8,7 +8,7 @@ replicated experts, 1171.5 ms); read that document first, everything not
 restated here (model checkpoint fingerprints, host topology, workload file
 digest, verification of the bench output) is unchanged.
 
-Headline numbers, mean TTFT over 8 × 32,768-token ShareGPT prompts at
+Historical baseline numbers, mean TTFT over 8 × 32,768-token ShareGPT prompts at
 concurrency 1 (`vllm bench serve`, output length 1, prefix caching off):
 
 | configuration | branch @ commit | FlashInfer | KV cache | mean TTFT | median | p99 |
@@ -22,6 +22,95 @@ The same CP4·EP4·PP2 arm on the random 32,768/1 workload (`--dataset-name rand
 8 prompts) measured 1140.0 ms with FlashInfer 0.6.14 and 1134.0 ms with FlashInfer
 main; the FlashInfer upgrade alone is neutral. Real text is faster than random
 tokens because routing is more concentrated, so fewer experts are active per rank.
+
+## Fused SM12x MoE reproduction
+
+This branch includes the opt-in `--moe-backend flashinfer_sm12x` runner.
+It fuses FC1 + SiLU + FP8 activation quantization and FC2 + weighted finalization.
+The existing EP expert map, FP8 CP all-gather and BF16 DMA reduce-scatter remain
+in use. Expert weights are MXFP4; NVFP4, when selected, applies to the KV cache.
+The automatic backend choice remains unchanged.
+
+Build from a full checkout of `nvfp4-sparse-mla`, using the baseline image described
+in the NVFP4 section below (including its FlashInfer-main installation):
+
+```bash
+git clone --branch nvfp4-sparse-mla https://github.com/xiaoweiw-nv/vllm.git vllm-fused
+cd vllm-fused
+# After the FlashInfer-main build in the NVFP4 section:
+docker build -f docker/nvfp4-sparse-mla/Dockerfile.nvfp4 \
+  -t vllm:cp4ep4pp2-nvfp4 .
+docker build -f docker/fused-sm12x/Dockerfile \
+  --build-arg BASE_IMAGE=vllm:cp4ep4pp2-nvfp4 \
+  -t vllm:nvfp4-fused-sm12x .
+export IMAGE=vllm:nvfp4-fused-sm12x
+export MOE_BACKEND=flashinfer_sm12x
+export KV_CACHE_DTYPE=nvfp4_fi_ds_mla
+```
+
+The Docker recipe copies this branch and installs only the 15 fused FlashInfer
+modules plus `tllm_enums.py` from pinned commit
+`61503db7ee6442e393ed119662f4d066d5098524` (PR4720). It preserves package
+initialization and unrelated attention kernels. No workspace artifact directory
+or pre-existing local fused image is needed. The prerequisite images are local
+build tags, not published images; follow the baseline build instructions below.
+The original measured images used the same selective overlay.
+
+Use the server and ShareGPT client commands below with these variables. DMA,
+PIECEWISE graphs, capture sizes 512/1024, and `--linear-backend deep_gemm` stay
+as shown. For a matched control, restart the same image with
+`MOE_BACKEND=deep_gemm`, keep the KV dtype fixed, and rerun warmup and measurement.
+Confirm `Using 'FLASHINFER_SM12X_MXFP4'`, `PcpPcieDmaPrepareAndFinalize`, and
+`Graph capturing finished` in the fused server log.
+
+### Measured fused results
+
+All rows below use eight ShareGPT 32768/1 requests, concurrency 1, seed 42,
+after two full-length warmups. Values are milliseconds.
+
+| Rig/date (UTC) | KV dtype | DeepGEMM mean | Fused mean | Fused median | Fused P99 | Mean reduction |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| rig-9, 2026-09-11 | FP8 | 1182.10 | 1108.59 | 1109.09 | 1112.84 | 6.22% |
+| rig-16, 2026-09-11 | FP8 | no paired control | 1002.27 | 1001.37 | 1009.12 | — |
+| rig-16, 2026-09-12 | NVFP4 | 1000.75 | **939.22** | 939.04 | 947.01 | **6.15%** |
+
+Every measured arm completed 8/8 requests with zero failures. Both paired
+comparisons used identical images and server arguments except the MoE backend;
+the NVFP4 pair also verified identical environments. Do not infer a paired
+speedup across rigs, dates, or the older baseline rows above. Rig-16 used
+one-second host-PID ownership sampling and observed no foreign process during
+measurement. The older rig-9 sampler excluded all vLLM process names, so its
+zero recorded samples cannot rule out foreign vLLM contention.
+
+Aggregate results, image hashes and numerical smoke deltas are committed in
+[`benchmarks/distributed/results/cp4_sm12x_fused_sharegpt.json`](benchmarks/distributed/results/cp4_sm12x_fused_sharegpt.json).
+
+### Validation and numerical limits
+
+All eight GPU tests in
+[`test_flashinfer_sm12x_mxfp4_moe.py`](tests/kernels/moe/test_flashinfer_sm12x_mxfp4_moe.py)
+passed in the combined NVFP4 image. Coverage includes checkpoint-scale packing,
+nonidentity EP maps, empty routes, graph replay across capture sizes, and NaN
+scale padding. The NVFP4 cache staging/append test also passed. Run the fused
+suite on an idle GPU in the built image:
+
+```bash
+docker run --rm --gpus '"device=0"' --ipc host \
+  -e CUTE_DSL_ARCH=sm_120a -e VLLM_USE_DEEP_GEMM=1 \
+  -e VLLM_USE_DEEP_GEMM_E8M0=1 -w /opt/vllm-src \
+  --entrypoint /opt/venv/bin/python "$IMAGE" \
+  -m pytest tests/kernels/moe/test_flashinfer_sm12x_mxfp4_moe.py -v
+```
+
+The runner supports bias-free SiLU experts and FP8 dynamic-128/UE8M0 activation
+scales on SM12x; unsupported activation/bias semantics are rejected. Its
+workspace clears scale padding on every invocation: UE8M0 byte 255 is NaN,
+and zero routing weights do not mask NaN in the FC2 epilogue.
+
+One-token greedy smoke outputs match DeepGEMM on 3/4 prompts for the NVFP4
+pair. The random 6144-token prompt differs, and tail logprobs also differ.
+This is not bitwise equivalence or full model-accuracy certification; the
+combined path has not had a task-level accuracy evaluation.
 
 ## What the configuration is
 
@@ -52,7 +141,7 @@ multiples of 4096 or 2048, no prefix caching, no async scheduling, no
 `prompt_logprobs`, `--kv-cache-dtype fp8_ds_mla` (or `nvfp4_fi_ds_mla` on the
 NVFP4 branch), PCP world size 2 or 4 with PP such that PCP × PP = 8.
 
-## Source revision
+## Baseline source revision
 
 Branch `cp4ep4pp2` at `fe100040f`. It is the published CP2PP4 tip `f944ad32`
 plus seven commits, all Python plus shell scripts (no C++/CUDA changes, so the
@@ -88,7 +177,7 @@ Identical to the CP2PP4 document except where noted:
 | NCCL | patched `2.30.4`, `/opt/libnccl-local-inference.so.2.30.4` (PP send/recv and startup only) |
 | GPUs | 8 × "NVIDIA Graphics Device" GB202, 110 SMs, 73,415 MiB, PCIe only (no NVLink), two NUMA domains. CUDA peer access (P2P over PCIe) between all pairs of the four PCP ranks is required for pcie_dma; check `nvidia-smi topo -p2p r`. |
 
-Build the image as in the CP2PP4 document (pinned vLLM wheel + DeepGEMM +
+For the prerequisite baseline image, build as in the CP2PP4 document (pinned vLLM wheel + DeepGEMM +
 FlashInfer), then overlay this branch:
 
 ```bash
@@ -119,7 +208,9 @@ file as in the CP2PP4 measurement.
 ## Start the server
 
 ```bash
-export IMAGE=vllm:cp4ep4pp2-fe100040f
+export IMAGE=${IMAGE:-vllm:nvfp4-fused-sm12x}
+export MOE_BACKEND=${MOE_BACKEND:-flashinfer_sm12x}
+export KV_CACHE_DTYPE=${KV_CACHE_DTYPE:-nvfp4_fi_ds_mla}
 export MODEL=/path/to/DeepSeek-V4-Flash
 export DATASET_DIR=/path/to/cp2pp4-sharegpt32k
 export RESULT_DIR=/path/to/results
@@ -134,6 +225,8 @@ docker run -d --name dsv4-cp4ep4pp2 \
   -v "$RESULT_DIR:/results" \
   -e CUDA_DEVICE_ORDER=PCI_BUS_ID \
   -e CUTE_DSL_ARCH=sm_120a \
+  -e NVSHMEM_HEAP_KIND=VIDMEM -e NVSHMEM_REMOTE_TRANSPORT=none \
+  -e NVSHMEM_SYMMETRIC_SIZE=8G \
   -e VLLM_DSV4_CP2PP4=1 \
   -e VLLM_PP_LAYER_PARTITION=22,21 \
   -e VLLM_ENABLE_PCIE_ALLREDUCE=1 -e VLLM_PCIE_ALLREDUCE_BACKEND=cpp \
@@ -154,13 +247,13 @@ docker run -d --name dsv4-cp4ep4pp2 \
   --pipeline-parallel-size 2 --prefill-context-parallel-size 4 \
   --enable-expert-parallel --enable-ep-weight-filter --all2all-backend pcie_dma \
   --attention-backend FLASHINFER_MLA_SPARSE_DSV4 \
-  --kv-cache-dtype fp8_ds_mla --block-size 256 \
+  --kv-cache-dtype "$KV_CACHE_DTYPE" --block-size 256 \
   --gpu-memory-utilization 0.8 --kv-cache-memory-bytes 10737418240 \
   --max-model-len 65536 --max-num-seqs 1 --max-num-batched-tokens 4096 \
   --enable-chunked-prefill --no-enable-prefix-caching --no-async-scheduling \
   --no-enable-flashinfer-autotune \
   -cc.cudagraph_mode=PIECEWISE --cudagraph-capture-sizes 512 1024 \
-  --moe-backend deep_gemm --linear-backend deep_gemm
+  --moe-backend "$MOE_BACKEND" --linear-backend deep_gemm
 ```
 
 Differences from the CP2PP4 command: `--pipeline-parallel-size 2
@@ -188,13 +281,11 @@ then measure eight prompts at concurrency 1:
 ```bash
 BASE=http://127.0.0.1:$PORT
 for i in 1 2; do
-  docker exec dsv4-cp4ep4pp2 /opt/venv/bin/vllm bench serve \
-    --backend openai --base-url "$BASE" --endpoint /v1/completions \
-    --model /models/DeepSeek-V4-Flash --served-model-name deepseek-v4-flash \
-    --tokenizer /models/DeepSeek-V4-Flash --trust-remote-code \
-    --dataset-name custom --dataset-path /prompts/sharegpt32k.jsonl --custom-output-len 1 \
-    --skip-chat-template --tokenizer-mode deepseek_v4 \
-    --num-prompts 1 --max-concurrency 1 --ignore-eos --seed $i
+  docker exec dsv4-cp4ep4pp2 /opt/venv/bin/python \
+    /opt/vllm-src/benchmarks/distributed/openai_greedy_compare.py run \
+    --base-url "$BASE" --model deepseek-v4-flash \
+    --prompt-spec const:1000:32768 --max-tokens 1 --logprobs 5 \
+    --out "/results/warmup$i.json"
 done
 
 docker exec dsv4-cp4ep4pp2 /opt/venv/bin/vllm bench serve \
@@ -209,7 +300,8 @@ docker exec dsv4-cp4ep4pp2 /opt/venv/bin/vllm bench serve \
 ```
 
 Expected: `Successful requests: 8`, `Total input tokens: 262144`, mean TTFT
-≈1068 ms (FlashInfer main) with p99 within ~15 ms of the mean. Confirm
+as reported for the selected backend/KV combination above; the historical
+DeepGEMM FP8 baseline was ≈1068 ms. Confirm
 `vllm:prompt_tokens_total` grew by exactly 262,144 during the run and prefix-cache
 hits stayed at zero (`curl $BASE/metrics`). Run with no other process on the
 GPUs: on the shared test node a co-tenant on any GPU inflated TTFT 2× through
@@ -224,7 +316,7 @@ CP2PP4 (replicated-expert) reference using
 
 ```bash
 for spec in const:1000:32768 const:2000:4096 rand:0:4096:1000:50000 rand:1:6144:1000:50000; do
-  docker exec dsv4-cp4ep4pp2 /opt/venv/bin/python /results/openai_greedy_compare.py run \
+  docker exec dsv4-cp4ep4pp2 /opt/venv/bin/python /opt/vllm-src/benchmarks/distributed/openai_greedy_compare.py run \
     --base-url "$BASE" --model deepseek-v4-flash --prompt-spec "$spec" \
     --max-tokens 1 --logprobs 5 --out "/results/greedy-${spec//:/_}.json"
 done
