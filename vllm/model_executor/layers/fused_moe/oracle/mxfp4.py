@@ -98,6 +98,7 @@ class Mxfp4MoeBackend(Enum):
     B12X = "B12X"
     # DeepGEMM FP8xFP4 backend (SM100+)
     DEEPGEMM_MXFP4 = "DEEPGEMM_MXFP4"
+    FLASHINFER_SM12X_MXFP4 = "FLASHINFER_SM12X_MXFP4"
     # FlashInfer TRTLLM backends
     FLASHINFER_TRTLLM_MXFP4_MXFP8 = "FLASHINFER_TRTLLM_MXFP4_MXFP8"
     FLASHINFER_TRTLLM_MXFP4_BF16 = "FLASHINFER_TRTLLM_MXFP4_BF16"
@@ -161,6 +162,13 @@ def backend_to_kernel_cls(
         )
 
         return [DeepGemmFP4Experts]
+
+    elif backend == Mxfp4MoeBackend.FLASHINFER_SM12X_MXFP4:
+        from vllm.model_executor.layers.fused_moe.experts.flashinfer_sm12x_mxfp4_moe import (  # noqa: E501
+            FlashInferSM12xMXFP4Experts,
+        )
+
+        return [FlashInferSM12xMXFP4Experts]
 
     elif backend in (
         Mxfp4MoeBackend.FLASHINFER_TRTLLM_MXFP4_BF16,
@@ -278,6 +286,7 @@ def map_mxfp4_backend(runner_backend: MoEBackend) -> list[Mxfp4MoeBackend]:
     mapping: dict[str, list[Mxfp4MoeBackend]] = {
         "b12x": [Mxfp4MoeBackend.B12X],
         "deep_gemm": [Mxfp4MoeBackend.DEEPGEMM_MXFP4],
+        "flashinfer_sm12x": [Mxfp4MoeBackend.FLASHINFER_SM12X_MXFP4],
         "flashinfer_trtllm": [
             Mxfp4MoeBackend.FLASHINFER_TRTLLM_MXFP4_BF16,
             Mxfp4MoeBackend.FLASHINFER_TRTLLM_MXFP4_MXFP8,
@@ -358,7 +367,10 @@ def _get_priority_backends() -> list[Mxfp4MoeBackend]:
 
 def _backend_activation_key(backend: Mxfp4MoeBackend) -> QuantKey | None:
     """Map backend to its activation key (FP8, MXFP8, or None for BF16)."""
-    if backend == Mxfp4MoeBackend.DEEPGEMM_MXFP4:
+    if backend in (
+        Mxfp4MoeBackend.DEEPGEMM_MXFP4,
+        Mxfp4MoeBackend.FLASHINFER_SM12X_MXFP4,
+    ):
         return kFp8Dynamic128Sym
     if backend in (
         Mxfp4MoeBackend.FLASHINFER_TRTLLM_MXFP4_MXFP8,
@@ -654,7 +666,10 @@ def mxfp4_round_up_hidden_size_and_intermediate_size(
     """Round up hidden_size and intermediate_size based on backend requirements."""
     if backend == Mxfp4MoeBackend.B12X:
         return hidden_size, intermediate_size
-    if backend == Mxfp4MoeBackend.DEEPGEMM_MXFP4:
+    if backend in (
+        Mxfp4MoeBackend.DEEPGEMM_MXFP4,
+        Mxfp4MoeBackend.FLASHINFER_SM12X_MXFP4,
+    ):
         # DeepGEMM requires M/N/K alignment
         intermediate_size = round_up(intermediate_size, 128)
         hidden_size = round_up(hidden_size, 128)
@@ -706,6 +721,12 @@ def convert_gpt_oss_weight_to_mxfp4_moe_kernel_format(
     torch.Tensor | None,
 ]:
     """Convert loaded weights into backend-specific kernel format."""
+
+    if mxfp4_backend == Mxfp4MoeBackend.FLASHINFER_SM12X_MXFP4:
+        raise NotImplementedError(
+            "flashinfer_sm12x currently supports bias-free SiLU MXFP4 experts, "
+            "not GPT-OSS gated-activation semantics"
+        )
 
     if mxfp4_backend == Mxfp4MoeBackend.B12X:
         return (
@@ -1291,6 +1312,21 @@ def convert_weight_to_mxfp4_moe_kernel_format(
     Supports DeepGEMM, TRTLLM MXFP8, Triton and Marlin backends.
     """
 
+    if mxfp4_backend == Mxfp4MoeBackend.FLASHINFER_SM12X_MXFP4:
+        from vllm.model_executor.layers.fused_moe.experts.flashinfer_sm12x_mxfp4_moe import (  # noqa: E501
+            prepare_flashinfer_sm12x_mxfp4_weights,
+        )
+
+        if w13_bias is not None or w2_bias is not None:
+            raise ValueError("flashinfer_sm12x does not support expert biases")
+        prepared = prepare_flashinfer_sm12x_mxfp4_weights(
+            w13_weight.data,
+            w2_weight.data,
+            w13_weight_scale.data,
+            w2_weight_scale.data,
+        )
+        return (*prepared, None, None)
+
     if mxfp4_backend == Mxfp4MoeBackend.B12X:
         return (
             w13_weight.data,
@@ -1699,7 +1735,10 @@ def make_mxfp4_moe_quant_config(
     layer: "RoutedExperts | None" = None,
 ) -> FusedMoEQuantConfig | None:
     """Create a FusedMoEQuantConfig for the given MXFP4 backend."""
-    if mxfp4_backend == Mxfp4MoeBackend.DEEPGEMM_MXFP4:
+    if mxfp4_backend in (
+        Mxfp4MoeBackend.DEEPGEMM_MXFP4,
+        Mxfp4MoeBackend.FLASHINFER_SM12X_MXFP4,
+    ):
         from vllm.model_executor.layers.quantization.utils.quant_utils import (
             GroupShape,
         )
